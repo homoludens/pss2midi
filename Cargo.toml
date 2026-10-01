@@ -1,0 +1,12 @@
+[package]
+name = "pss2midi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+alsa = "0.11"
+anyhow = "1"
+aubio = { version = "0.2.1", default-features = false, features = ["pkg-config"] }
+clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.4"
+midir = "0.11"
