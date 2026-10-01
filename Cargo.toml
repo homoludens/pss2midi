@@ -2,6 +2,8 @@
 name = "pss2midi"
 version = "0.1.0"
 edition = "2021"
+description = "Low-latency Yamaha PSS-F30 audio to MIDI converter"
+license = "GPL-3.0-only"
 
 [dependencies]
 alsa = "0.11"
