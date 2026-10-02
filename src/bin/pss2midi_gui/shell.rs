@@ -2243,7 +2243,7 @@ fn live_controls(
         device_selector = device_selector.child(menu);
     }
 
-    let mut panel = div()
+    let controls = div()
         .w_full()
         .flex()
         .items_stretch()
@@ -2331,6 +2331,12 @@ fn live_controls(
                 .child(template_status_summary(&state.template_status)),
         );
 
+    let mut panel = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(theme::SPACE_SM))
+        .child(controls);
     if let Some(error) = &state.error_banner {
         panel = panel.child(error_banner_panel(error, cx));
     }
