@@ -23,7 +23,7 @@
 
 - [x] 3.1 Wire startup to load settings, enumerate audio devices, load templates when present, initialize MIDI, open Live, and honor saved auto-start behavior; verify first launch and missing-template startup remain usable.
 - [x] 3.2 Connect calibration completion and Start Playing to template save/reload, Spectral mode selection, Live navigation, and engine start when stopped; verify a completed calibration can drive spectral detection.
-- [ ] 3.3 Connect GPUI close handling to engine shutdown and worker join, ensuring active MIDI notes are released and audio resources are dropped; verify shutdown with an active note and during capture.
+- [x] 3.3 Connect GPUI close handling to engine shutdown and worker join, ensuring active MIDI notes are released and audio resources are dropped; verify shutdown with an active note and during capture.
 - [ ] 3.4 Replace CLI-first binary startup with direct GUI launch and remove unused CLI-only code/dependencies; verify `cargo run --release` opens the desktop app without CLI arguments.
 
 ## 4. Verification

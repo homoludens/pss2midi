@@ -221,17 +221,17 @@ impl PssEngine {
 
     /// Ask the worker to stop and join it. Repeated calls are harmless.
     pub fn shutdown(&mut self) -> io::Result<()> {
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+
         // A disconnected worker is still joined below, so shutdown remains
         // reliable if it has already exited or panicked.
         let _ = self.command_tx.send(EngineCommand::Shutdown);
 
-        if let Some(worker) = self.worker.take() {
-            worker
-                .join()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "engine worker panicked"))?;
-        }
-
-        Ok(())
+        worker
+            .join()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "engine worker panicked"))
     }
 
     fn spawn_with_runtime<F, R>(runtime_factory: F, settings: WorkerSettings) -> io::Result<Self>
@@ -1631,6 +1631,8 @@ mod tests {
         actions: Arc<Mutex<Vec<FakeAction>>>,
         provider_state: Arc<Mutex<FakeProviderState>>,
         capture_entered: Option<Sender<()>>,
+        capture_release: Option<Receiver<()>>,
+        drop_signal: Option<Sender<()>>,
         fail_first_start: bool,
         fail_midi_start: bool,
         midi_open: bool,
@@ -1668,6 +1670,8 @@ mod tests {
                     fail_starts: HashMap::new(),
                 })),
                 capture_entered: None,
+                capture_release: None,
+                drop_signal: None,
                 fail_first_start: false,
                 fail_midi_start: false,
                 midi_open: false,
@@ -1698,6 +1702,29 @@ mod tests {
         fn with_capture_signal(mut self, capture_entered: Sender<()>) -> Self {
             self.capture_entered = Some(capture_entered);
             self
+        }
+
+        fn with_capture_barrier(
+            mut self,
+            capture_entered: Sender<()>,
+            capture_release: Receiver<()>,
+        ) -> Self {
+            self.capture_entered = Some(capture_entered);
+            self.capture_release = Some(capture_release);
+            self
+        }
+
+        fn with_drop_signal(mut self, drop_signal: Sender<()>) -> Self {
+            self.drop_signal = Some(drop_signal);
+            self
+        }
+    }
+
+    impl Drop for FakeRuntime {
+        fn drop(&mut self) {
+            if let Some(drop_signal) = self.drop_signal.take() {
+                let _ = drop_signal.send(());
+            }
         }
     }
 
@@ -1863,6 +1890,9 @@ mod tests {
                 .push(FakeAction::CaptureWait(max_wait));
             if let Some(capture_entered) = self.capture_entered.take() {
                 let _ = capture_entered.send(());
+            }
+            if let Some(capture_release) = self.capture_release.take() {
+                let _ = capture_release.recv();
             }
             if !self.calibration_active && self.active_note.is_none() {
                 self.active_note = Some(60);
@@ -2365,7 +2395,9 @@ mod tests {
     #[test]
     fn start_stop_and_shutdown_drive_the_runtime_lifecycle() {
         let actions = Arc::new(Mutex::new(Vec::new()));
-        let mut engine = spawn_fake(FakeRuntime::new(Arc::clone(&actions)));
+        let (drop_signal, dropped) = std::sync::mpsc::channel();
+        let runtime = FakeRuntime::new(Arc::clone(&actions)).with_drop_signal(drop_signal);
+        let mut engine = spawn_fake(runtime);
 
         engine.send(EngineCommand::Start).unwrap();
         assert_eq!(
@@ -2400,6 +2432,10 @@ mod tests {
         assert_eq!(capture_note, EngineEvent::NoteOn { midi_note: 60 });
 
         engine.shutdown().unwrap();
+        dropped
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runtime resources were not dropped during shutdown");
+        assert!(engine.worker.is_none(), "shutdown must join the worker");
         assert_eq!(
             recv_until(&engine, |event| *event
                 == EngineEvent::NoteOff { midi_note: 60 }),
@@ -2409,6 +2445,8 @@ mod tests {
             recv_until(&engine, |event| *event == EngineEvent::WorkerStopped),
             EngineEvent::WorkerStopped
         );
+        engine.shutdown().unwrap();
+        assert!(engine.worker.is_none(), "repeated shutdown must not rejoin");
         assert_eq!(
             *actions.lock().unwrap(),
             vec![
@@ -2429,6 +2467,68 @@ mod tests {
                     released_note: Some(60),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn shutdown_during_capture_releases_note_before_joining_worker() {
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let (capture_entered, capture_started) = std::sync::mpsc::channel();
+        let (capture_release, release_capture) = std::sync::mpsc::channel();
+        let (drop_signal, dropped) = std::sync::mpsc::channel();
+        let runtime = FakeRuntime::new(Arc::clone(&actions))
+            .with_capture_barrier(capture_entered, release_capture)
+            .with_drop_signal(drop_signal);
+        let mut engine = spawn_fake(runtime);
+
+        engine.send(EngineCommand::Start).unwrap();
+        recv_until(&engine, |event| {
+            *event == EngineEvent::StateChanged(EngineState::Running)
+        });
+        capture_started
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker did not enter capture");
+
+        let release_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            capture_release.send(()).unwrap();
+        });
+        let shutdown_started = Instant::now();
+        engine.shutdown().unwrap();
+        assert!(
+            shutdown_started.elapsed() >= Duration::from_millis(40),
+            "shutdown should wait for the in-progress capture step"
+        );
+        release_thread.join().unwrap();
+        dropped
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runtime resources were not dropped during shutdown");
+        assert!(engine.worker.is_none(), "shutdown must join the worker");
+
+        assert_eq!(
+            recv_until(&engine, |event| *event
+                == EngineEvent::NoteOn { midi_note: 60 }),
+            EngineEvent::NoteOn { midi_note: 60 }
+        );
+        assert_eq!(
+            recv_until(&engine, |event| *event
+                == EngineEvent::NoteOff { midi_note: 60 }),
+            EngineEvent::NoteOff { midi_note: 60 }
+        );
+        assert_eq!(
+            recv_until(&engine, |event| *event == EngineEvent::WorkerStopped),
+            EngineEvent::WorkerStopped
+        );
+        engine.shutdown().unwrap();
+
+        let actions = actions.lock().unwrap();
+        assert!(matches!(actions.first(), Some(FakeAction::Start { .. })));
+        assert!(actions.contains(&FakeAction::CaptureWait(CAPTURE_POLL_INTERVAL)));
+        assert_eq!(
+            actions.last(),
+            Some(&FakeAction::Stop {
+                released_note: Some(60),
+            })
         );
     }
 

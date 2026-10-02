@@ -5,7 +5,7 @@ use std::{
 
 use gpui::{
     div, prelude::*, px, rgb, size, App, Context, CursorStyle, FocusHandle, FontWeight,
-    KeyDownEvent, MouseButton, Render, Task, Window, WindowBounds, WindowOptions,
+    KeyDownEvent, MouseButton, Render, Subscription, Task, Window, WindowBounds, WindowOptions,
 };
 use pss2midi::{
     engine::{
@@ -55,6 +55,7 @@ struct Pss2MidiApp {
     settings_saved: bool,
     event_task: Option<Task<()>>,
     engine: Option<PssEngine>,
+    _shutdown_subscription: Option<Subscription>,
 }
 
 struct ConfigSaveRequest {
@@ -112,7 +113,12 @@ impl Pss2MidiApp {
             settings_saved: false,
             event_task: None,
             engine: None,
+            _shutdown_subscription: None,
         };
+        app._shutdown_subscription = Some(cx.on_app_quit(|app, _cx| {
+            app.shutdown();
+            async {}
+        }));
         if let Some(message) = config_error {
             app.state
                 .reduce_event(EngineEvent::Error { message }, Instant::now());
@@ -421,6 +427,18 @@ impl Pss2MidiApp {
             .is_err()
         {
             self.settings_error = Some("Settings could not be queued for saving".to_owned());
+        }
+    }
+
+    fn shutdown(&mut self) {
+        // This foreground task must not apply queued events while the engine is
+        // synchronously joining on the final close path.
+        drop(self.event_task.take());
+
+        if let Some(mut engine) = self.engine.take() {
+            if let Err(error) = engine.shutdown() {
+                eprintln!("Could not shut down the engine worker cleanly: {error}");
+            }
         }
     }
 }
@@ -2686,7 +2704,15 @@ pub(super) fn launch(cx: &mut App) {
     let options = window_options(cx);
     cx.open_window(options, |window, cx| {
         window.set_window_title(APP_WINDOW_TITLE);
-        cx.new(Pss2MidiApp::new)
+        let app = cx.new(Pss2MidiApp::new);
+        let app_handle = app.downgrade();
+        window.on_window_should_close(cx, move |_window, cx| {
+            app_handle
+                .update(cx, |app, _cx| app.shutdown())
+                .map(|()| true)
+                .unwrap_or(true)
+        });
+        app
     })
     .expect("failed to open GPUI window");
 }
