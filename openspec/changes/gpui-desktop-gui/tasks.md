@@ -14,7 +14,7 @@
 - [x] 2.1 Implement the UI `AppState` and event reducer, including a bounded recent-event history and coalesced level updates; verify note, detector, lifecycle, calibration, and error events update state correctly.
 - [x] 2.2 Build the GPUI app shell with centralized theme, top bar, Live/Calibration/Settings navigation, and target window sizing; verify all pages are reachable and the layout remains usable at approximately 850×600.
 - [x] 2.3 Implement reusable status, meter, detector, match-row, event-log, and 37-key piano components; verify MIDI 36–72 mapping, white/black key order, and C2/C3/C4/C5 labels with unit tests.
-- [ ] 2.4 Build the Live view from actual engine state, including dominant note, latency, levels, YIN/spectral results, disagreement, top three matches, recent events, and keyboard highlights; verify displayed values update from test engine events.
+- [x] 2.4 Build the Live view from actual engine state, including dominant note, latency, levels, YIN/spectral results, disagreement, top three matches, recent events, and keyboard highlights; verify displayed values update from test engine events.
 - [ ] 2.5 Add Start/Stop, audio-device selection/retry, detector-mode controls, and MIDI output status to the UI; verify controls issue engine commands and reflect success and recoverable errors.
 - [ ] 2.6 Build the Calibration view with requested note/sample progress, quality feedback, retry/cancel actions, and completed/current/remaining keyboard states; verify UI state across accepted, rejected, retried, and canceled samples.
 - [ ] 2.7 Build the Settings view for audio, detector, spectral, MIDI status, and collapsed advanced controls; verify edits are reflected in `AppConfig` and survive serialization/reload.

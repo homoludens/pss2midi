@@ -1,18 +1,39 @@
+use std::time::Duration;
+
 use gpui::{
     div, prelude::*, px, rgb, size, App, Context, FontWeight, Render, Window, WindowBounds,
     WindowOptions,
 };
-use pss2midi::ui::state::{AppState, Page};
+use pss2midi::{
+    engine::note::note_name,
+    ui::state::{AppState, Page},
+};
 
-use crate::theme;
+use crate::{
+    components::{
+        DetectorCard, EventLog, LevelMeter, ScoreMeter, SpectralMatchRow, StatusBadge, StatusTone,
+    },
+    live::{DetectorAgreement, LiveViewModel},
+    piano::PianoKeyboard,
+    theme,
+};
 
 const APP_WINDOW_TITLE: &str = "pss2midi — Yamaha PSS-F30 Audio to MIDI";
 pub(super) const INITIAL_WINDOW_SIZE: (f32, f32) = (1000.0, 680.0);
 pub(super) const MINIMUM_WINDOW_SIZE: (f32, f32) = (850.0, 600.0);
 
-#[derive(Default)]
 struct Pss2MidiApp {
     state: AppState,
+    show_log: bool,
+}
+
+impl Default for Pss2MidiApp {
+    fn default() -> Self {
+        Self {
+            state: AppState::default(),
+            show_log: true,
+        }
+    }
 }
 
 impl Render for Pss2MidiApp {
@@ -30,7 +51,7 @@ impl Render for Pss2MidiApp {
                     .flex_1()
                     .min_h_0()
                     .child(self.sidebar(cx))
-                    .child(self.page_content()),
+                    .child(self.page_content(cx)),
             )
     }
 }
@@ -163,15 +184,15 @@ impl Pss2MidiApp {
             )
     }
 
-    fn page_content(&self) -> impl IntoElement {
+    fn page_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (eyebrow, title, description, panel_title, panel_description, marker) =
             match self.state.page {
                 Page::Live => (
                     "MONITORING",
                     "Live",
-                    "A workspace for instrument detection and MIDI activity.",
-                    "Live monitor",
-                    "Detection status, audio levels, and recent events will appear here.",
+                    "Live detection, input levels, and detector comparison.",
+                    "",
+                    "",
                     "01",
                 ),
                 Page::Calibration => (
@@ -191,6 +212,14 @@ impl Pss2MidiApp {
                     "03",
                 ),
             };
+
+        let content = div().flex_1().min_h_0();
+        let content = match self.state.page {
+            Page::Live => content.child(self.live_dashboard(cx)),
+            Page::Calibration | Page::Settings => {
+                content.child(placeholder_panel(panel_title, panel_description, marker))
+            }
+        };
 
         div()
             .flex()
@@ -225,58 +254,481 @@ impl Pss2MidiApp {
                             .child(description),
                     ),
             )
+            .child(content)
+    }
+
+    fn live_dashboard(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = LiveViewModel::from_state(&self.state);
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .id("live-dashboard-scroll")
+            .overflow_y_scroll()
             .child(
                 div()
-                    .flex_1()
-                    .min_h_0()
+                    .w_full()
                     .flex()
                     .flex_col()
-                    .items_center()
-                    .justify_center()
                     .gap(px(theme::SPACE_MD))
-                    .p(px(theme::SPACE_XL))
-                    .rounded_lg()
-                    .bg(rgb(theme::PANEL))
-                    .border_1()
-                    .border_color(rgb(theme::BORDER))
+                    .pb(px(theme::SPACE_MD))
                     .child(
                         div()
-                            .size(px(52.0))
+                            .w_full()
+                            .flex()
+                            .items_stretch()
+                            .gap(px(theme::SPACE_SM))
+                            .child(dominant_note_panel(&view))
+                            .child(input_levels_panel(&view)),
+                    )
+                    .child(comparison_panel(&view))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_stretch()
+                            .gap(px(theme::SPACE_SM))
+                            .child(div().flex_1().min_w_0().child(DetectorCard::yin(
+                                view.yin_result.as_ref(),
+                                view.yin_is_output,
+                            )))
+                            .child(div().flex_1().min_w_0().child(DetectorCard::spectral(
+                                view.spectral_result.as_ref(),
+                                view.spectral_is_output,
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_stretch()
+                            .gap(px(theme::SPACE_SM))
+                            .child(spectral_scores_panel(&view))
+                            .child(spectral_matches_panel(&view)),
+                    )
+                    .child(keyboard_panel(&view))
+                    .child(
+                        div()
+                            .w_full()
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .rounded_lg()
-                            .bg(rgb(theme::PANEL_INSET))
-                            .text_size(px(theme::FONT_BODY))
-                            .text_color(rgb(theme::ACCENT))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(marker),
+                            .justify_between()
+                            .gap(px(theme::SPACE_SM))
+                            .child(
+                                div()
+                                    .text_size(px(theme::FONT_SMALL))
+                                    .text_color(rgb(theme::TEXT_PRIMARY))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Recent events"),
+                            )
+                            .child(
+                                div()
+                                    .id("live-show-log-toggle")
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(theme::SPACE_SM))
+                                    .px(px(theme::SPACE_SM))
+                                    .py(px(theme::SPACE_XS))
+                                    .rounded_md()
+                                    .bg(rgb(theme::PANEL_INSET))
+                                    .border_1()
+                                    .border_color(rgb(theme::BORDER))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.show_log = !this.show_log;
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::FONT_CAPTION))
+                                            .text_color(rgb(theme::TEXT_SECONDARY))
+                                            .child("Show log"),
+                                    )
+                                    .child(
+                                        StatusBadge::new(
+                                            if self.show_log { "ON" } else { "OFF" },
+                                            if self.show_log {
+                                                StatusTone::Accent
+                                            } else {
+                                                StatusTone::Neutral
+                                            },
+                                        )
+                                        .render(),
+                                    ),
+                            ),
                     )
-                    .child(
-                        div()
-                            .text_size(px(theme::FONT_TITLE))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(panel_title),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(theme::FONT_BODY))
-                            .text_color(rgb(theme::TEXT_SECONDARY))
-                            .child(panel_description),
-                    )
-                    .child(
-                        div()
-                            .mt(px(theme::SPACE_SM))
-                            .px(px(theme::SPACE_MD))
-                            .py(px(theme::SPACE_SM))
-                            .rounded_md()
-                            .bg(rgb(theme::PANEL_INSET))
-                            .text_size(px(theme::FONT_CAPTION))
-                            .text_color(rgb(theme::TEXT_MUTED))
-                            .child("PAGE PLACEHOLDER"),
-                    ),
+                    .child(EventLog::new(&self.state.recent_events, self.show_log).render()),
             )
     }
+}
+
+fn placeholder_panel(
+    title: &'static str,
+    description: &'static str,
+    marker: &'static str,
+) -> impl IntoElement {
+    div()
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(theme::SPACE_MD))
+        .p(px(theme::SPACE_XL))
+        .rounded_lg()
+        .bg(rgb(theme::PANEL))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .child(
+            div()
+                .size(px(52.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_lg()
+                .bg(rgb(theme::PANEL_INSET))
+                .text_size(px(theme::FONT_BODY))
+                .text_color(rgb(theme::ACCENT))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(marker),
+        )
+        .child(
+            div()
+                .text_size(px(theme::FONT_TITLE))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(title),
+        )
+        .child(
+            div()
+                .text_size(px(theme::FONT_BODY))
+                .text_color(rgb(theme::TEXT_SECONDARY))
+                .child(description),
+        )
+        .child(
+            div()
+                .mt(px(theme::SPACE_SM))
+                .px(px(theme::SPACE_MD))
+                .py(px(theme::SPACE_SM))
+                .rounded_md()
+                .bg(rgb(theme::PANEL_INSET))
+                .text_size(px(theme::FONT_CAPTION))
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child("PAGE PLACEHOLDER"),
+        )
+}
+
+fn dominant_note_panel(view: &LiveViewModel) -> impl IntoElement {
+    let (headline, note_number, detail) = match &view.dominant_note {
+        Some(note) => (
+            note.name.clone(),
+            format!("MIDI {}", note.midi_note),
+            "Current dominant detection".to_owned(),
+        ),
+        None => (
+            "Idle".to_owned(),
+            "Unavailable".to_owned(),
+            "Waiting for a selected engine note".to_owned(),
+        ),
+    };
+    let latency = view
+        .latency
+        .map(format_latency)
+        .unwrap_or_else(|| "Unavailable".to_owned());
+
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(theme::SPACE_SM))
+        .p(px(theme::SPACE_MD))
+        .rounded_md()
+        .bg(rgb(theme::PANEL))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(theme::SPACE_SM))
+                .child(
+                    div()
+                        .text_size(px(theme::FONT_CAPTION))
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("DOMINANT NOTE"),
+                )
+                .child(
+                    StatusBadge::new(
+                        if view.dominant_note.is_some() {
+                            "DETECTED"
+                        } else {
+                            "IDLE"
+                        },
+                        if view.dominant_note.is_some() {
+                            StatusTone::Success
+                        } else {
+                            StatusTone::Neutral
+                        },
+                    )
+                    .render(),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_baseline()
+                .gap(px(theme::SPACE_SM))
+                .child(
+                    div()
+                        .text_size(px(27.0))
+                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(headline),
+                )
+                .child(
+                    div()
+                        .text_size(px(theme::FONT_SMALL))
+                        .text_color(rgb(theme::TEXT_SECONDARY))
+                        .child(note_number),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(theme::SPACE_SM))
+                .child(
+                    div()
+                        .text_size(px(theme::FONT_CAPTION))
+                        .text_color(rgb(theme::TEXT_SECONDARY))
+                        .child(detail),
+                )
+                .child(
+                    div()
+                        .text_size(px(theme::FONT_CAPTION))
+                        .text_color(rgb(theme::TEXT_SECONDARY))
+                        .child(format!("Latency · {latency}")),
+                ),
+        )
+}
+
+fn input_levels_panel(view: &LiveViewModel) -> impl IntoElement {
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(theme::SPACE_MD))
+        .p(px(theme::SPACE_MD))
+        .rounded_md()
+        .bg(rgb(theme::PANEL))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .child(
+            div()
+                .text_size(px(theme::FONT_CAPTION))
+                .text_color(rgb(theme::TEXT_MUTED))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child("INPUT LEVEL"),
+        )
+        .child(LevelMeter::new("RMS", view.levels.map(|levels| levels.rms_dbfs)).render())
+        .child(LevelMeter::new("Peak", view.levels.map(|levels| levels.peak_dbfs)).render())
+}
+
+fn comparison_panel(view: &LiveViewModel) -> impl IntoElement {
+    let (label, tone, message) = match view.agreement {
+        DetectorAgreement::Waiting => (
+            "WAITING",
+            StatusTone::Neutral,
+            "Agreement unavailable · waiting for both detector notes".to_owned(),
+        ),
+        DetectorAgreement::Agree { note } => (
+            "AGREE",
+            StatusTone::Success,
+            format!("YIN and Spectral agree on {}", note_name(note)),
+        ),
+        DetectorAgreement::Disagree {
+            yin_note,
+            spectral_note,
+        } => (
+            "DISAGREEMENT",
+            StatusTone::Warning,
+            format!(
+                "YIN {} · Spectral {}",
+                note_name(yin_note),
+                note_name(spectral_note)
+            ),
+        ),
+    };
+    let output = if view.yin_is_output {
+        "YIN is authoritative for output"
+    } else {
+        "Spectral is authoritative for output"
+    };
+
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(theme::SPACE_MD))
+        .px(px(theme::SPACE_MD))
+        .py(px(theme::SPACE_SM))
+        .rounded_md()
+        .bg(rgb(theme::PANEL_INSET))
+        .border_1()
+        .border_color(rgb(if tone == StatusTone::Warning {
+            theme::WARNING
+        } else {
+            theme::BORDER
+        }))
+        .child(
+            div()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(theme::SPACE_SM))
+                .child(StatusBadge::new(label, tone).render())
+                .child(
+                    div()
+                        .text_size(px(theme::FONT_SMALL))
+                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .child(message),
+                ),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text_size(px(theme::FONT_CAPTION))
+                .text_color(rgb(theme::TEXT_SECONDARY))
+                .child(output),
+        )
+}
+
+fn spectral_scores_panel(view: &LiveViewModel) -> impl IntoElement {
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(theme::SPACE_MD))
+        .p(px(theme::SPACE_MD))
+        .rounded_md()
+        .bg(rgb(theme::PANEL))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .child(
+            div()
+                .text_size(px(theme::FONT_SMALL))
+                .text_color(rgb(theme::TEXT_PRIMARY))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child("Spectral confidence & margin"),
+        )
+        .child(
+            ScoreMeter::new(
+                "Confidence",
+                view.spectral_result
+                    .as_ref()
+                    .map(|result| result.confidence),
+            )
+            .render(),
+        )
+        .child(
+            ScoreMeter::new(
+                "Margin",
+                view.spectral_result.as_ref().map(|result| result.margin),
+            )
+            .render(),
+        )
+}
+
+fn spectral_matches_panel(view: &LiveViewModel) -> impl IntoElement {
+    let mut panel = div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(theme::SPACE_SM))
+        .p(px(theme::SPACE_MD))
+        .rounded_md()
+        .bg(rgb(theme::PANEL))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .child(
+            div()
+                .text_size(px(theme::FONT_SMALL))
+                .text_color(rgb(theme::TEXT_PRIMARY))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child("Top spectral matches"),
+        );
+
+    if view.ranked_matches.is_empty() {
+        panel = panel.child(
+            div()
+                .text_size(px(theme::FONT_CAPTION))
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child("No ranked matches available"),
+        );
+    } else {
+        panel = panel.children(view.ranked_matches.iter().cloned().enumerate().map(
+            |(index, candidate)| {
+                SpectralMatchRow::new(index + 1, candidate, view.keyboard_selected_note).render()
+            },
+        ));
+    }
+
+    panel
+}
+
+fn keyboard_panel(view: &LiveViewModel) -> impl IntoElement {
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(theme::SPACE_SM))
+        .p(px(theme::SPACE_MD))
+        .rounded_md()
+        .bg(rgb(theme::PANEL))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(theme::SPACE_SM))
+                .child(
+                    div()
+                        .text_size(px(theme::FONT_SMALL))
+                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Keyboard activity · MIDI 36–72"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(theme::SPACE_XS))
+                        .child(StatusBadge::new("Selected", StatusTone::Accent).render())
+                        .child(StatusBadge::new("YIN", StatusTone::Warning).render()),
+                ),
+        )
+        .child(
+            PianoKeyboard::new()
+                .selected_note(view.keyboard_selected_note)
+                .yin_note(view.keyboard_yin_note)
+                .render(),
+        )
+}
+
+fn format_latency(latency: Duration) -> String {
+    format!("{:.2} ms", latency.as_secs_f64() * 1_000.0)
 }
 
 fn top_bar() -> impl IntoElement {

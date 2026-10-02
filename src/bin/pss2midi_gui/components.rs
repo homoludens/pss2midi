@@ -127,6 +127,74 @@ impl LevelMeter {
     }
 }
 
+/// Displays an optional normalized detector score with its exact reading.
+pub(crate) struct ScoreMeter {
+    label: String,
+    value: Option<f32>,
+}
+
+impl ScoreMeter {
+    pub(crate) fn new(label: impl Into<String>, value: Option<f32>) -> Self {
+        Self {
+            label: label.into(),
+            value,
+        }
+    }
+
+    pub(crate) fn render(&self) -> impl IntoElement {
+        let value = self.value.filter(|value| value.is_finite());
+        let fill = value.map(|value| value.clamp(0.0, 1.0)).unwrap_or(0.0);
+        let reading = value
+            .map(|value| format!("{value:.3} · {:.0}%", value * 100.0))
+            .unwrap_or_else(|| "Unavailable".to_owned());
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(theme::SPACE_XS))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(theme::SPACE_SM))
+                    .child(
+                        div()
+                            .text_size(px(theme::FONT_CAPTION))
+                            .text_color(rgb(theme::TEXT_SECONDARY))
+                            .child(self.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme::FONT_CAPTION))
+                            .text_color(rgb(theme::TEXT_PRIMARY))
+                            .child(reading),
+                    ),
+            )
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .h(px(7.0))
+                    .overflow_hidden()
+                    .rounded_full()
+                    .bg(rgb(theme::PANEL_INSET))
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left_0()
+                            .w(relative(fill))
+                            .rounded_full()
+                            .bg(rgb(theme::ACCENT)),
+                    ),
+            )
+    }
+}
+
 /// Detector result card constructors keep YIN and spectral details consistent.
 pub(crate) struct DetectorCard;
 
