@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use midir::{os::unix::VirtualOutput, MidiOutput, MidiOutputConnection};
 
-use crate::engine::note::note_name;
-
 pub const OUTPUT_NAME: &str = "PSS-F30 Audio MIDI";
 
 pub struct Midi {
@@ -42,7 +40,6 @@ impl Midi {
         self.conn
             .send(&[0x90, note, 100])
             .context("MIDI NOTE ON failed")?;
-        println!("ON   {:4} MIDI={}", note_name(note), note);
         Ok(())
     }
 
@@ -50,7 +47,6 @@ impl Midi {
         self.conn
             .send(&[0x80, note, 0])
             .context("MIDI NOTE OFF failed")?;
-        println!("OFF  {:4} MIDI={}", note_name(note), note);
         Ok(())
     }
 }

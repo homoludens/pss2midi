@@ -12,7 +12,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::engine::config::{
-    default_template_path, AudioArgs, DetectorMode, RunArgs, SpectralArgs,
+    default_template_path, AudioConfig, DetectorMode, RunConfig, SpectralConfig,
 };
 
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -125,10 +125,10 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// Map persisted desktop preferences to the engine's runtime arguments.
-    pub fn to_run_args(&self) -> RunArgs {
-        RunArgs {
-            audio: AudioArgs {
+    /// Map persisted desktop preferences to the engine's runtime configuration.
+    pub fn to_run_args(&self) -> RunConfig {
+        RunConfig {
+            audio: AudioConfig {
                 device: self.audio.device.clone(),
                 sample_rate: self.audio.sample_rate,
                 hop: self.advanced.hop_size,
@@ -145,15 +145,14 @@ impl AppConfig {
             onset_threshold: self.advanced.onset_threshold,
             vote_ratio: self.advanced.vote_ratio,
             initial_stable: self.advanced.initial_stable_frames,
-            templates: Some(self.template_path.clone()),
-            spectral: SpectralArgs {
+            template_path: self.template_path.clone(),
+            spectral: SpectralConfig {
                 spectral_delay_ms: self.spectral.delay_ms,
                 spectral_window_ms: self.spectral.window_ms,
                 fft_size: self.advanced.fft_size,
                 spectral_min_score: self.spectral.minimum_score,
                 spectral_min_margin: self.spectral.minimum_margin,
             },
-            debug: false,
         }
     }
 
@@ -605,7 +604,7 @@ mod tests {
         assert_eq!(defaults.spectral.fft_size, 2048);
         assert_eq!(defaults.spectral.spectral_min_score, 0.75);
         assert_eq!(defaults.spectral.spectral_min_margin, 0.03);
-        assert_eq!(defaults.templates, Some(AppConfig::default().template_path));
+        assert_eq!(defaults.template_path, AppConfig::default().template_path);
 
         let mut config = AppConfig::default();
         config.audio.device = "hw:4,0".to_owned();
@@ -652,8 +651,8 @@ mod tests {
         assert_eq!(args.spectral.spectral_min_margin, 0.07);
         assert_eq!(args.spectral.fft_size, 4096);
         assert_eq!(
-            args.templates,
-            Some(PathBuf::from("/tmp/custom-templates.json"))
+            args.template_path,
+            PathBuf::from("/tmp/custom-templates.json")
         );
     }
 

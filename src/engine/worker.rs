@@ -8,12 +8,8 @@ use std::{
     time::Duration,
 };
 
-#[cfg(test)]
-use crate::engine::config::Cli;
 use anyhow::{Context, Result};
 use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
-#[cfg(test)]
-use clap::Parser;
 
 use crate::engine::{
     app_config::AppConfig,
@@ -25,7 +21,7 @@ use crate::engine::{
         CalibrationNoteCompletion, CalibrationProgress, CalibrationResult, CalibrationSession,
         CalibrationUpdate, DEFAULT_SAMPLES_PER_NOTE,
     },
-    config::{default_template_path, DetectorMode, RunArgs},
+    config::{DetectorMode, RunConfig},
     detector::{Detector, DetectorOutcome, NoteDecision, SpectralResult, YinResult},
     features::FeatureExtractor,
     midi::{
@@ -276,7 +272,7 @@ impl Drop for PssEngine {
 #[derive(Clone, Debug)]
 struct WorkerSettings {
     /// All mapped runtime settings are retained between Start/Stop cycles.
-    args: RunArgs,
+    args: RunConfig,
     mode: DetectorMode,
     device: String,
     template_path: PathBuf,
@@ -287,18 +283,17 @@ struct WorkerSettings {
 
 impl WorkerSettings {
     #[cfg(test)]
-    fn from_args(args: &RunArgs) -> Self {
+    fn from_args(args: &RunConfig) -> Self {
         Self::from_args_and_preference(args, None)
     }
 
     #[cfg(test)]
-    fn from_args_and_preference(args: &RunArgs, preferred_device: Option<String>) -> Self {
-        let template_path = args.templates.clone().unwrap_or_else(default_template_path);
+    fn from_args_and_preference(args: &RunConfig, preferred_device: Option<String>) -> Self {
         Self {
             args: args.clone(),
             mode: args.detector,
             device: args.audio.device.clone(),
-            template_path,
+            template_path: args.template_path.clone(),
             preferred_device,
             pending_device: None,
             device_selection_resolved: false,
@@ -517,7 +512,7 @@ fn run_worker<R>(
             EngineCommand::SetTemplatePath { path } => {
                 let mut next_settings = settings.clone();
                 next_settings.template_path = path.clone();
-                next_settings.args.templates = Some(path);
+                next_settings.args.template_path = path;
                 let mut events = Vec::new();
                 runtime.set_template_path(&next_settings, &mut events);
                 publish_events(&event_tx, events);
@@ -591,7 +586,7 @@ fn run_worker<R>(
                 let mut next_settings = settings.clone();
                 if let Some(path) = path {
                     next_settings.template_path = path.clone();
-                    next_settings.args.templates = Some(path);
+                    next_settings.args.template_path = path;
                 }
                 let mut events = Vec::new();
                 let loaded = runtime.reload_templates(&next_settings, &mut events);
@@ -886,7 +881,7 @@ fn publish_events(event_tx: &EngineEventSender, events: Vec<EngineEvent>) {
 }
 
 struct ProductionRuntime {
-    args: RunArgs,
+    args: RunConfig,
     audio_device_provider: Box<dyn AudioDeviceProvider>,
     midi_output_provider: Box<dyn MidiOutputProvider>,
     midi: Option<Box<dyn MidiPort>>,
@@ -908,11 +903,11 @@ struct PendingTemplateSave {
 
 impl ProductionRuntime {
     fn new(
-        args: RunArgs,
+        args: RunConfig,
         audio_device_provider: Box<dyn AudioDeviceProvider>,
         midi_output_provider: Box<dyn MidiOutputProvider>,
     ) -> Self {
-        let current_template_path = args.templates.clone().unwrap_or_else(default_template_path);
+        let current_template_path = args.template_path.clone();
         Self {
             args,
             audio_device_provider,
@@ -930,7 +925,7 @@ impl ProductionRuntime {
         }
     }
 
-    fn update_template_status(&mut self, args: &RunArgs, events: &mut Vec<EngineEvent>) -> bool {
+    fn update_template_status(&mut self, args: &RunConfig, events: &mut Vec<EngineEvent>) -> bool {
         let (templates, status) = load_configured_templates(&self.current_template_path, args);
         self.templates = templates;
         self.template_status = status.clone();
@@ -1097,7 +1092,7 @@ impl ProductionRuntime {
 
 fn load_configured_templates(
     path: &std::path::Path,
-    args: &RunArgs,
+    args: &RunConfig,
 ) -> (Option<TemplateFile>, TemplateStatus) {
     let make_error = |message: String| TemplateStatus::Error {
         path: path.to_path_buf(),
@@ -1587,10 +1582,8 @@ fn release_active_note<M: MidiPort + ?Sized>(
 }
 
 #[cfg(test)]
-fn default_run_args() -> RunArgs {
-    Cli::try_parse_from(["pss2midi"])
-        .expect("the built-in engine defaults must be valid")
-        .run
+fn default_run_args() -> RunConfig {
+    RunConfig::default()
 }
 
 #[cfg(test)]
@@ -1978,7 +1971,7 @@ mod tests {
         fn open_capture(
             &mut self,
             _device_id: &str,
-            args: &crate::engine::config::AudioArgs,
+            args: &crate::engine::config::AudioConfig,
         ) -> Result<OpenedAudioCapture, AudioDeviceUnavailable> {
             Ok(OpenedAudioCapture::new(
                 SilentAudioFrames,
@@ -2154,7 +2147,7 @@ mod tests {
 
         let mut invalid_settings = settings;
         invalid_settings.template_path = invalid_path.clone();
-        invalid_settings.args.templates = Some(invalid_path.clone());
+        invalid_settings.args.template_path = invalid_path.clone();
         events.clear();
         assert!(!runtime.reload_templates(&invalid_settings, &mut events));
         assert!(matches!(

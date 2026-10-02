@@ -88,16 +88,16 @@ impl TemplateFile {
         );
         ensure!(
             self.fft_size == fft_size,
-            "template FFT size {} does not match --fft-size {fft_size}",
+            "template FFT size {} does not match configured FFT size {fft_size}",
             self.fft_size
         );
         ensure!(
             (self.window_ms - window_ms).abs() < 0.001,
-            "template window does not match --spectral-window-ms"
+            "template window does not match configured spectral window"
         );
         ensure!(
             (self.delay_ms - delay_ms).abs() < 0.001,
-            "template delay does not match --spectral-delay-ms"
+            "template delay does not match configured spectral delay"
         );
 
         for note in MIN_MIDI..=MAX_MIDI {

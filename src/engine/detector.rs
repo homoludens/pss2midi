@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context, Result};
@@ -7,9 +6,9 @@ use aubio::{Pitch, PitchMode, PitchUnit};
 pub use crate::engine::templates::RankedMatch;
 
 use crate::engine::{
-    config::{default_template_path, DetectorMode, RunArgs},
+    config::{DetectorMode, RunConfig},
     features::{FeatureExtractor, SampleCapture, SampleHistory},
-    note::{ms_to_hops, note_name, quantize_pitch, rms_db, MIN_MIDI, NOTE_COUNT},
+    note::{ms_to_hops, quantize_pitch, rms_db, MIN_MIDI, NOTE_COUNT},
     onset::OnsetDetector,
     templates::{validate_for_extractor, Classification, TemplateFile},
 };
@@ -181,17 +180,7 @@ struct PendingSpectral {
     onset_at: Instant,
     capture: SampleCapture,
     yin_ready: bool,
-    yin_note: Option<u8>,
     classification: Option<Classification>,
-}
-
-#[derive(Default)]
-struct CompareStats {
-    events: u64,
-    agree: u64,
-    disagree: u64,
-    spectral_rejected: u64,
-    confusion: BTreeMap<(u8, u8), u64>,
 }
 
 pub struct Detector {
@@ -221,31 +210,21 @@ pub struct Detector {
     spectral_min_margin: f32,
     history: SampleHistory,
     sample_index: u64,
-    debug: bool,
-    started_at: Instant,
-    compare_stats: CompareStats,
 }
 
 impl Detector {
-    pub fn new(args: &RunArgs, sample_rate: u32, hop: usize) -> Result<Self> {
+    pub fn new(args: &RunConfig, sample_rate: u32, hop: usize) -> Result<Self> {
         let templates = if args.detector == DetectorMode::Yin {
             None
         } else {
-            let default_path;
-            let path = if let Some(path) = args.templates.as_deref() {
-                path
-            } else {
-                default_path = default_template_path();
-                default_path.as_path()
-            };
-            Some(TemplateFile::load(path)?)
+            Some(TemplateFile::load(&args.template_path)?)
         };
         Self::new_with_templates(args, sample_rate, hop, templates)
     }
 
     /// Construct a detector using templates already loaded by the worker.
     pub fn new_with_templates(
-        args: &RunArgs,
+        args: &RunConfig,
         sample_rate: u32,
         hop: usize,
         loaded_templates: Option<TemplateFile>,
@@ -254,17 +233,17 @@ impl Detector {
             ensure!(
                 args.spectral.spectral_delay_ms.is_finite()
                     && args.spectral.spectral_delay_ms >= 0.0,
-                "--spectral-delay-ms must be a finite non-negative number"
+                "spectral delay must be a finite non-negative number"
             );
             ensure!(
                 args.spectral.spectral_min_score.is_finite()
                     && (0.0..=1.0).contains(&args.spectral.spectral_min_score),
-                "--spectral-min-score must be between 0 and 1"
+                "spectral minimum score must be between 0 and 1"
             );
             ensure!(
                 args.spectral.spectral_min_margin.is_finite()
                     && (0.0..=1.0).contains(&args.spectral.spectral_min_margin),
-                "--spectral-min-margin must be between 0 and 1"
+                "spectral minimum margin must be between 0 and 1"
             );
         }
         let mode = args.detector;
@@ -331,20 +310,7 @@ impl Detector {
             spectral_min_margin: args.spectral.spectral_min_margin,
             history: SampleHistory::new((sample_rate as usize / 5).max(hop)),
             sample_index: 0,
-            debug: args.debug,
-            started_at: Instant::now(),
-            compare_stats: CompareStats::default(),
         })
-    }
-
-    fn debug(&self, message: impl AsRef<str>) {
-        if self.debug {
-            println!(
-                "[{:10.2} ms] {}",
-                self.started_at.elapsed().as_secs_f64() * 1000.0,
-                message.as_ref()
-            );
-        }
     }
 
     fn clear_fallback(&mut self) {
@@ -366,9 +332,9 @@ impl Detector {
                 self.last_trigger = Some(now);
             }
             Some(current) if current == note => {
-                let Some(onset_time) = onset_time else {
+                if onset_time.is_none() {
                     return (decisions, None);
-                };
+                }
                 let cooldown_ok = self
                     .last_trigger
                     .map(|last| now.duration_since(last) >= self.retrigger_time)
@@ -379,25 +345,12 @@ impl Detector {
                 decisions.push(NoteDecision::NoteOff { note });
                 decisions.push(NoteDecision::NoteOn { note });
                 self.last_trigger = Some(now);
-                self.debug(format!(
-                    "same-note retrigger {} ; onset->MIDI {:.1} ms",
-                    note_name(note),
-                    now.duration_since(onset_time).as_secs_f64() * 1000.0
-                ));
             }
             Some(current) => {
                 decisions.push(NoteDecision::NoteOff { note: current });
                 decisions.push(NoteDecision::NoteOn { note });
                 self.current_note = Some(note);
                 self.last_trigger = Some(now);
-                if let Some(onset_time) = onset_time {
-                    self.debug(format!(
-                        "change {} -> {} ; onset->MIDI {:.1} ms",
-                        note_name(current),
-                        note_name(note),
-                        now.duration_since(onset_time).as_secs_f64() * 1000.0
-                    ));
-                }
             }
         }
         let emitted_note_on = decisions
@@ -419,7 +372,6 @@ impl Detector {
         if self.mode == DetectorMode::Compare {
             if let Some(pending) = self.pending_spectral.as_mut() {
                 pending.yin_ready = true;
-                pending.yin_note = None;
             }
         }
         if self.mode == DetectorMode::Yin {
@@ -458,14 +410,7 @@ impl Detector {
         let onset_detected = self.onset.detect(frame)?;
 
         if self.mode == DetectorMode::Yin {
-            self.process_yin(
-                level,
-                pitch_value,
-                detected,
-                onset_detected,
-                now,
-                &mut outcome,
-            )?;
+            self.process_yin(level, detected, onset_detected, now, &mut outcome)?;
             return Ok(self.complete_outcome(outcome));
         }
 
@@ -476,7 +421,6 @@ impl Detector {
             if self.silence_count >= self.release_hops {
                 outcome.note_decisions.extend(self.release());
             }
-            self.debug(format!("level={level:6.1} dB silence"));
         } else {
             self.silence_count = 0;
         }
@@ -492,7 +436,6 @@ impl Detector {
                 onset_at: now,
                 capture,
                 yin_ready: false,
-                yin_note: None,
                 classification: None,
             });
             self.pending_yin = (self.mode == DetectorMode::Compare).then(|| {
@@ -503,17 +446,12 @@ impl Detector {
                     self.decision_extension_hops,
                 )
             });
-            self.debug(format!("ONSET level={level:.1} dB pitch={pitch_value:.2}"));
         }
 
         if self.mode == DetectorMode::Compare {
             if let Some(yin_result) = self.advance_yin_decision(detected) {
                 if let Some(pending) = self.pending_spectral.as_mut() {
                     pending.yin_ready = true;
-                    pending.yin_note = yin_result
-                        .accepted
-                        .then_some(yin_result.candidate_note)
-                        .flatten();
                 }
                 if let Some(yin) = outcome.yin.as_mut() {
                     yin.decision = Some(yin_result);
@@ -566,7 +504,6 @@ impl Detector {
     fn process_yin(
         &mut self,
         level: f32,
-        midi_float: f32,
         detected: Option<(u8, f32)>,
         onset_detected: bool,
         now: Instant,
@@ -578,7 +515,6 @@ impl Detector {
             if self.silence_count >= self.release_hops {
                 outcome.note_decisions.extend(self.release());
             }
-            self.debug(format!("level={level:6.1} dB silence"));
             return Ok(());
         }
         self.silence_count = 0;
@@ -592,19 +528,16 @@ impl Detector {
                 self.decision_extension_hops,
             ));
             self.clear_fallback();
-            self.debug(format!("ONSET level={level:.1} dB pitch={midi_float:.2}"));
         }
 
         if let Some(mut pending) = self.pending_yin.take() {
             if pending.ignore_left > 0 {
                 pending.ignore_left -= 1;
                 self.pending_yin = Some(pending);
-                self.debug(format!("attack-ignore pitch={midi_float:.2}"));
                 return Ok(());
             }
-            if let Some((note, cents)) = detected {
+            if let Some((note, _cents)) = detected {
                 pending.vote(note);
-                self.debug(format!("vote {} ({cents:+.1}c)", note_name(note)));
             }
             pending.collect_left = pending.collect_left.saturating_sub(1);
             if pending.collect_left > 0 {
@@ -614,14 +547,6 @@ impl Detector {
 
             let decision = pending.result(self.vote_ratio);
             let onset_at = pending.onset_at;
-            if let Some(winner) = decision.candidate_note {
-                self.debug(format!(
-                    "decision {} votes={} ratio={:.2}",
-                    note_name(winner),
-                    decision.vote_count,
-                    decision.vote_ratio.unwrap_or_default(),
-                ));
-            }
             if decision.accepted {
                 let winner = decision
                     .candidate_note
@@ -639,29 +564,20 @@ impl Detector {
                 pending.extensions_left -= 1;
                 pending.collect_left = pending.extension_hops;
                 self.pending_yin = Some(pending);
-                self.debug("ambiguous onset; extending decision window");
                 return Ok(());
             }
             if let Some(yin) = outcome.yin.as_mut() {
                 yin.decision = Some(decision);
             }
-            self.debug("onset decision rejected");
             return Ok(());
         }
 
-        let Some((note, cents)) = detected else {
+        let Some((note, _cents)) = detected else {
             self.clear_fallback();
             return Ok(());
         };
-        if let Some(current) = self.current_note {
+        if self.current_note.is_some() {
             self.clear_fallback();
-            if current != note {
-                self.debug(format!(
-                    "ignoring pitch change without onset: {} -> {} ({cents:+.1}c)",
-                    note_name(current),
-                    note_name(note)
-                ));
-            }
             return Ok(());
         }
         if level < self.silence_db + FALLBACK_ATTACK_MARGIN_DB {
@@ -674,12 +590,6 @@ impl Detector {
             self.fallback_note = Some(note);
             self.fallback_count = 1;
         }
-        self.debug(format!(
-            "initial fallback {} {}/{} ({cents:+.1}c)",
-            note_name(note),
-            self.fallback_count,
-            self.initial_stable
-        ));
         if self.fallback_count >= self.initial_stable {
             let (actions, latency) = self.send_new_note(note, None);
             outcome.note_decisions.extend(actions);
@@ -728,40 +638,7 @@ impl Detector {
         let spectral_note = classification.accepted.then_some(classification.note);
         let released_before_result =
             self.current_note.is_none() && self.silence_count >= self.release_hops;
-        if self.mode == DetectorMode::Compare {
-            self.compare_stats.events += 1;
-            if !classification.accepted {
-                self.compare_stats.spectral_rejected += 1;
-            }
-            if pending.yin_ready && pending.yin_note == spectral_note {
-                self.compare_stats.agree += 1;
-            } else {
-                self.compare_stats.disagree += 1;
-                if let (Some(yin), Some(spectral)) = (pending.yin_note, spectral_note) {
-                    *self
-                        .compare_stats
-                        .confusion
-                        .entry((yin, spectral))
-                        .or_default() += 1;
-                }
-            }
-        }
-
-        self.debug(format!(
-            "spectral: best={}({}) score={:.3} second={:.3} margin={:.3} {}",
-            note_name(classification.note),
-            classification.note,
-            classification.score,
-            classification.second_score,
-            classification.margin,
-            if classification.accepted {
-                "accepted"
-            } else {
-                "rejected: below score or ambiguous"
-            },
-        ));
         if released_before_result {
-            self.debug("discarding spectral result after sustained silence");
             let mut spectral = SpectralResult::from_classification(classification);
             spectral.selected_note = None;
             outcome.spectral = Some(spectral);
@@ -777,36 +654,16 @@ impl Detector {
     }
 
     pub fn shutdown(&mut self) -> Vec<NoteDecision> {
-        let decisions = self.release();
-        if self.mode == DetectorMode::Compare {
-            println!(
-                "Compare summary: events={} agree={} disagree={} spectral_rejected={}",
-                self.compare_stats.events,
-                self.compare_stats.agree,
-                self.compare_stats.disagree,
-                self.compare_stats.spectral_rejected,
-            );
-            for ((yin, spectral), count) in &self.compare_stats.confusion {
-                println!(
-                    "  YIN {} -> Spectral {}: {} times",
-                    note_name(*yin),
-                    note_name(*spectral),
-                    count
-                );
-            }
-        }
-        decisions
+        self.release()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::config::Cli;
-    use clap::Parser;
 
     fn yin_detector() -> Detector {
-        let args = Cli::try_parse_from(["pss2midi"]).unwrap().run;
+        let args = RunConfig::default();
         Detector::new(&args, args.audio.sample_rate, args.audio.hop).unwrap()
     }
 

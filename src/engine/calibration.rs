@@ -1,14 +1,10 @@
-use std::io::{self, Write};
-
-use anyhow::{ensure, Context, Result};
+use anyhow::{ensure, Result};
 
 use crate::engine::{
-    audio::{open_capture, AudioFrameReader},
-    config::{default_template_path, AudioArgs, CalibrateArgs, SpectralArgs},
+    config::{AudioConfig, SpectralConfig},
     features::{FeatureExtractor, SampleCapture},
-    note::{note_name, rms_db, MAX_MIDI, MIN_MIDI, NOTE_COUNT},
+    note::{rms_db, MAX_MIDI, MIN_MIDI, NOTE_COUNT},
     onset::OnsetDetector,
-    persistence::TemplatePersistenceTask,
     templates::TemplateFile,
 };
 
@@ -95,10 +91,10 @@ pub struct CalibrationSession {
 
 impl CalibrationSession {
     pub fn new(
-        audio: &AudioArgs,
+        audio: &AudioConfig,
         sample_rate: u32,
         hop: usize,
-        spectral: &SpectralArgs,
+        spectral: &SpectralConfig,
         samples_per_note: usize,
     ) -> Result<Self> {
         ensure!(
@@ -314,132 +310,30 @@ impl CalibrationSession {
     }
 }
 
-pub fn run(args: CalibrateArgs) -> Result<()> {
-    ensure!(
-        args.samples_per_note > 0,
-        "--samples-per-note must be greater than zero"
-    );
-    let output = args.output.unwrap_or_else(default_template_path);
-    let (pcm, sample_rate, hop) = open_capture(&args.audio)?;
-    let mut reader = AudioFrameReader::new(&pcm, hop)?;
-    let mut session = CalibrationSession::new(
-        &args.audio,
-        sample_rate,
-        hop,
-        &args.spectral,
-        args.samples_per_note,
-    )?;
-
-    println!("PSS-F30 spectral calibration");
-    println!("Audio input: {}", args.audio.device);
-    println!("Output: {}", output.display());
-    println!("Samples per note: {}\n", args.samples_per_note);
-
-    let stdin = io::stdin();
-    let mut frame = vec![0.0f32; hop];
-    let mut completed_result = None;
-    while !session.is_complete() {
-        let progress = session.current_progress();
-        let label = note_name(progress.requested_note);
-        print!(
-            "Press Enter to arm {label} (MIDI {}) sample {}/{}; then play that key: ",
-            progress.requested_note, progress.sample_index, progress.samples_per_note
-        );
-        io::stdout().flush()?;
-        let mut line = String::new();
-        stdin
-            .read_line(&mut line)
-            .context("Could not read calibration prompt")?;
-        session.retry_current_sample();
-
-        let mut attempt_finished = false;
-        while !attempt_finished {
-            let frame_start = reader.next_frame(&mut frame)?;
-            for update in session.process_frame(frame_start, &frame)? {
-                match update {
-                    CalibrationUpdate::Progress(progress)
-                        if !matches!(
-                            &progress.quality,
-                            CalibrationSampleQuality::AwaitingOnset
-                        ) =>
-                    {
-                        match progress.quality {
-                            CalibrationSampleQuality::Accepted => println!(
-                                "  {} sample {}/{} accepted; RMS {:.1} dBFS, peak {:.3}",
-                                note_name(progress.requested_note),
-                                progress.accepted_samples_for_note,
-                                progress.samples_per_note,
-                                progress.rms_dbfs.unwrap_or(-120.0),
-                                progress.peak.unwrap_or(0.0)
-                            ),
-                            CalibrationSampleQuality::Rejected(reason) => println!(
-                                "  rejected {:?}; note/sample progress is unchanged",
-                                reason
-                            ),
-                            CalibrationSampleQuality::AwaitingOnset => unreachable!(),
-                        }
-                        attempt_finished = true;
-                    }
-                    CalibrationUpdate::NoteCompleted(note) => {
-                        println!("{} saved.\n", note_name(note.midi_note));
-                    }
-                    CalibrationUpdate::Completed(result) => completed_result = Some(result),
-                    CalibrationUpdate::Progress(_) => {}
-                }
-            }
-        }
-    }
-
-    let result = completed_result.context("calibration ended without a completed template set")?;
-    let persistence = TemplatePersistenceTask::spawn(result, output.clone())
-        .context("Could not start template persistence task")?;
-    persistence
-        .wait()
-        .map_err(|message| anyhow::anyhow!(message))?;
-    println!("Calibration complete.");
-    println!(
-        "Saved {} samples to {}",
-        NOTE_COUNT * args.samples_per_note,
-        output.display()
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::persistence::TemplatePersistenceTask;
     use std::{
         fs,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    fn audio_args() -> AudioArgs {
-        AudioArgs {
-            device: "pipewire".to_owned(),
-            sample_rate: 48_000,
-            hop: 128,
-            onset_buffer: 1024,
-            silence_db: -45.0,
-        }
+    fn audio_config() -> AudioConfig {
+        AudioConfig::default()
     }
 
-    fn spectral_args() -> SpectralArgs {
-        SpectralArgs {
-            spectral_delay_ms: 8.0,
-            spectral_window_ms: 30.0,
-            fft_size: 2048,
-            spectral_min_score: 0.75,
-            spectral_min_margin: 0.03,
-        }
+    fn spectral_config() -> SpectralConfig {
+        SpectralConfig::default()
     }
 
     fn session(samples_per_note: usize) -> CalibrationSession {
         CalibrationSession::new(
-            &audio_args(),
+            &audio_config(),
             48_000,
             128,
-            &spectral_args(),
+            &spectral_config(),
             samples_per_note,
         )
         .unwrap()

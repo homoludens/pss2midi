@@ -8,21 +8,21 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::engine::config::AudioArgs;
+use crate::engine::config::AudioConfig;
 
-pub fn open_capture(args: &AudioArgs) -> Result<(PCM, u32, usize)> {
+pub fn open_capture(args: &AudioConfig) -> Result<(PCM, u32, usize)> {
     open_capture_with_mode(args, false)
 }
 
 pub(crate) fn open_capture_for_worker(
-    args: &AudioArgs,
+    args: &AudioConfig,
 ) -> Result<(CaptureFrameReader, u32, usize)> {
     let (pcm, sample_rate, actual_period) = open_capture_with_mode(args, true)?;
     let reader = CaptureFrameReader::new(pcm, actual_period)?;
     Ok((reader, sample_rate, actual_period))
 }
 
-fn open_capture_with_mode(args: &AudioArgs, nonblocking: bool) -> Result<(PCM, u32, usize)> {
+fn open_capture_with_mode(args: &AudioConfig, nonblocking: bool) -> Result<(PCM, u32, usize)> {
     let pcm = PCM::new(&args.device, Direction::Capture, nonblocking)
         .with_context(|| format!("Cannot open ALSA capture PCM '{}'", args.device))?;
 
@@ -139,55 +139,5 @@ impl CaptureFrameReader {
 impl AudioFrameSource for CaptureFrameReader {
     fn try_next_frame(&mut self, frame: &mut [f32], timeout: Duration) -> Result<Option<u64>> {
         CaptureFrameReader::try_next_frame(self, frame, timeout)
-    }
-}
-
-/// Sequential fixed-size PCM frames, retaining partial ALSA reads between calls.
-pub struct AudioFrameReader<'a> {
-    pcm: &'a PCM,
-    io: IO<'a, i16>,
-    raw: Vec<i16>,
-    raw_offset: usize,
-    raw_len: usize,
-    sample_index: u64,
-}
-
-impl<'a> AudioFrameReader<'a> {
-    pub fn new(pcm: &'a PCM, hop: usize) -> Result<Self> {
-        Ok(Self {
-            pcm,
-            io: pcm.io_i16()?,
-            raw: vec![0; hop],
-            raw_offset: 0,
-            raw_len: 0,
-            sample_index: 0,
-        })
-    }
-
-    pub fn next_frame(&mut self, frame: &mut [f32]) -> Result<u64> {
-        anyhow::ensure!(!frame.is_empty(), "audio frame cannot be empty");
-        let frame_start = self.sample_index;
-        let frame_len = frame.len();
-        for sample in frame.iter_mut() {
-            while self.raw_offset == self.raw_len {
-                match self.io.readi(&mut self.raw) {
-                    Ok(frames_read) => {
-                        anyhow::ensure!(frames_read > 0, "ALSA capture returned an empty frame");
-                        self.raw_offset = 0;
-                        self.raw_len = frames_read;
-                    }
-                    Err(error) => {
-                        eprintln!("ALSA capture error: {error}; trying recovery");
-                        self.pcm.try_recover(error, false)?;
-                        self.raw_offset = 0;
-                        self.raw_len = 0;
-                    }
-                }
-            }
-            *sample = self.raw[self.raw_offset] as f32 / 32768.0;
-            self.raw_offset += 1;
-        }
-        self.sample_index += frame_len as u64;
-        Ok(frame_start)
     }
 }

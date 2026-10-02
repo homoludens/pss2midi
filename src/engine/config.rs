@@ -1,27 +1,10 @@
-//! Command-line and runtime configuration shared by the CLI and engine.
+//! GPUI-independent runtime configuration for the audio engine.
 
 use std::path::PathBuf;
 
-use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
-#[derive(Parser, Debug)]
-#[command(name = "pss2midi", about = "Low-latency Yamaha PSS-F30 audio to MIDI")]
-pub struct Cli {
-    #[command(subcommand)]
-    pub command: Option<Commands>,
-
-    #[command(flatten)]
-    pub run: RunArgs,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum Commands {
-    /// Capture spectral examples for all 37 PSS-F30 notes.
-    Calibrate(CalibrateArgs),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DetectorMode {
     Yin,
@@ -29,118 +12,86 @@ pub enum DetectorMode {
     Compare,
 }
 
-#[derive(ClapArgs, Debug, Clone)]
-pub struct AudioArgs {
-    /// ALSA capture PCM. "pipewire" uses PipeWire's default source.
-    #[arg(long, default_value = "pipewire")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioConfig {
+    /// ALSA capture PCM. `pipewire` uses PipeWire's default source.
     pub device: String,
-
-    #[arg(long, default_value_t = 48_000)]
     pub sample_rate: u32,
-
-    /// Requested ALSA/aubio hop size.
-    #[arg(long, default_value_t = 128)]
     pub hop: usize,
-
-    /// aubio onset analysis window.
-    #[arg(long, default_value_t = 1024)]
     pub onset_buffer: usize,
-
-    #[arg(long, default_value_t = -45.0, allow_hyphen_values = true)]
     pub silence_db: f32,
 }
 
-#[derive(ClapArgs, Debug, Clone)]
-pub struct RunArgs {
-    #[command(flatten)]
-    pub audio: AudioArgs,
-
-    /// Detector to use. YIN is the existing aubio pitch path.
-    #[arg(long, value_enum, default_value_t = DetectorMode::Yin)]
-    pub detector: DetectorMode,
-
-    /// aubio YIN pitch window.
-    #[arg(long, default_value_t = 2048)]
-    pub pitch_buffer: usize,
-
-    /// Ignore pitch estimates for this long after an onset.
-    #[arg(long, default_value_t = 10.0)]
-    pub attack_ignore_ms: f32,
-
-    /// Collect pitch votes for this long after attack-ignore.
-    #[arg(long, default_value_t = 20.0)]
-    pub decision_window_ms: f32,
-
-    /// If decision is ambiguous, extend once by this amount.
-    #[arg(long, default_value_t = 10.0)]
-    pub decision_extend_ms: f32,
-
-    /// Silence required before NOTE OFF.
-    #[arg(long, default_value_t = 30.0)]
-    pub release_ms: f32,
-
-    /// Minimum time between repeated same-note attacks.
-    #[arg(long, default_value_t = 60.0)]
-    pub retrigger_ms: f32,
-
-    /// aubio onset peak threshold.
-    #[arg(long, default_value_t = 0.30)]
-    pub onset_threshold: f32,
-
-    /// Fraction of valid YIN pitch votes required for winner.
-    #[arg(long, default_value_t = 0.60)]
-    pub vote_ratio: f32,
-
-    /// Stable frames required for YIN initial fallback acquisition.
-    #[arg(long, default_value_t = 10)]
-    pub initial_stable: usize,
-
-    /// Saved templates; defaults to ~/.config/pss2midi/pss-f30-templates.json.
-    #[arg(long)]
-    pub templates: Option<PathBuf>,
-
-    #[command(flatten)]
-    pub spectral: SpectralArgs,
-
-    #[arg(long)]
-    pub debug: bool,
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            device: "pipewire".to_owned(),
+            sample_rate: 48_000,
+            hop: 128,
+            onset_buffer: 1024,
+            silence_db: -45.0,
+        }
+    }
 }
 
-#[derive(ClapArgs, Debug, Clone)]
-pub struct SpectralArgs {
-    /// Ignore this many milliseconds after the detected onset.
-    #[arg(long, default_value_t = 8.0)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpectralConfig {
+    /// Delay after an onset before spectral feature capture begins.
     pub spectral_delay_ms: f32,
-
     /// Audio duration used for each spectral observation.
-    #[arg(long, default_value_t = 30.0)]
     pub spectral_window_ms: f32,
-
-    /// FFT size; must be a power of two and at least the window length.
-    #[arg(long, default_value_t = 2048)]
     pub fft_size: usize,
-
-    #[arg(long, default_value_t = 0.75)]
     pub spectral_min_score: f32,
-
-    #[arg(long, default_value_t = 0.03)]
     pub spectral_min_margin: f32,
 }
 
-#[derive(ClapArgs, Debug)]
-pub struct CalibrateArgs {
-    #[command(flatten)]
-    pub audio: AudioArgs,
+impl Default for SpectralConfig {
+    fn default() -> Self {
+        Self {
+            spectral_delay_ms: 8.0,
+            spectral_window_ms: 30.0,
+            fft_size: 2048,
+            spectral_min_score: 0.75,
+            spectral_min_margin: 0.03,
+        }
+    }
+}
 
-    /// Destination JSON file (defaults to ~/.config/pss2midi/pss-f30-templates.json).
-    #[arg(long)]
-    pub output: Option<PathBuf>,
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunConfig {
+    pub audio: AudioConfig,
+    pub detector: DetectorMode,
+    pub pitch_buffer: usize,
+    pub attack_ignore_ms: f32,
+    pub decision_window_ms: f32,
+    pub decision_extend_ms: f32,
+    pub release_ms: f32,
+    pub retrigger_ms: f32,
+    pub onset_threshold: f32,
+    pub vote_ratio: f32,
+    pub initial_stable: usize,
+    pub template_path: PathBuf,
+    pub spectral: SpectralConfig,
+}
 
-    #[arg(long, default_value_t = 5)]
-    pub samples_per_note: usize,
-
-    #[command(flatten)]
-    pub spectral: SpectralArgs,
+impl Default for RunConfig {
+    fn default() -> Self {
+        Self {
+            audio: AudioConfig::default(),
+            detector: DetectorMode::Yin,
+            pitch_buffer: 2048,
+            attack_ignore_ms: 10.0,
+            decision_window_ms: 20.0,
+            decision_extend_ms: 10.0,
+            release_ms: 30.0,
+            retrigger_ms: 60.0,
+            onset_threshold: 0.30,
+            vote_ratio: 0.60,
+            initial_stable: 10,
+            template_path: default_template_path(),
+            spectral: SpectralConfig::default(),
+        }
+    }
 }
 
 pub fn default_template_path() -> PathBuf {
@@ -155,34 +106,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn existing_run_command_defaults_to_yin() {
-        let cli = Cli::try_parse_from(["pss2midi", "--device", "pipewire", "--silence-db", "-45"])
-            .unwrap();
-        assert!(cli.command.is_none());
-        assert_eq!(cli.run.detector, DetectorMode::Yin);
-        assert_eq!(cli.run.audio.device, "pipewire");
-        assert_eq!(cli.run.audio.silence_db, -45.0);
-    }
+    fn runtime_configuration_defaults_match_desktop_engine_defaults() {
+        let config = RunConfig::default();
 
-    #[test]
-    fn detector_modes_are_selectable() {
-        for (argument, expected) in [
-            ("yin", DetectorMode::Yin),
-            ("spectral", DetectorMode::Spectral),
-            ("compare", DetectorMode::Compare),
-        ] {
-            let cli = Cli::try_parse_from(["pss2midi", "--detector", argument]).unwrap();
-            assert_eq!(cli.run.detector, expected);
-        }
-    }
-
-    #[test]
-    fn calibration_subcommand_accepts_capture_options() {
-        let cli =
-            Cli::try_parse_from(["pss2midi", "calibrate", "--samples-per-note", "3"]).unwrap();
-        let Some(Commands::Calibrate(args)) = cli.command else {
-            panic!("calibrate subcommand was not parsed");
-        };
-        assert_eq!(args.samples_per_note, 3);
+        assert_eq!(config.audio.device, "pipewire");
+        assert_eq!(config.audio.sample_rate, 48_000);
+        assert_eq!(config.audio.hop, 128);
+        assert_eq!(config.audio.onset_buffer, 1024);
+        assert_eq!(config.audio.silence_db, -45.0);
+        assert_eq!(config.detector, DetectorMode::Yin);
+        assert_eq!(config.pitch_buffer, 2048);
+        assert_eq!(config.attack_ignore_ms, 10.0);
+        assert_eq!(config.decision_window_ms, 20.0);
+        assert_eq!(config.decision_extend_ms, 10.0);
+        assert_eq!(config.release_ms, 30.0);
+        assert_eq!(config.retrigger_ms, 60.0);
+        assert_eq!(config.onset_threshold, 0.30);
+        assert_eq!(config.vote_ratio, 0.60);
+        assert_eq!(config.initial_stable, 10);
+        assert_eq!(config.template_path, default_template_path());
+        assert_eq!(config.spectral, SpectralConfig::default());
     }
 }

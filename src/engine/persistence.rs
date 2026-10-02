@@ -52,6 +52,7 @@ impl TemplatePersistenceTask {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn wait(mut self) -> std::result::Result<PathBuf, String> {
         let result = self
             .result_rx

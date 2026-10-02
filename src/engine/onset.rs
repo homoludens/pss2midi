@@ -1,7 +1,7 @@
 use anyhow::Result;
 use aubio::{Onset, OnsetMode};
 
-use crate::engine::config::AudioArgs;
+use crate::engine::config::AudioConfig;
 
 pub struct OnsetDetector {
     onset: Onset,
@@ -9,7 +9,7 @@ pub struct OnsetDetector {
 
 impl OnsetDetector {
     pub fn new(
-        args: &AudioArgs,
+        args: &AudioConfig,
         onset_buffer: usize,
         threshold: f32,
         min_interval_ms: f32,

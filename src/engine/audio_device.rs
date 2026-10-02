@@ -7,7 +7,7 @@ use anyhow::Context;
 
 use crate::engine::{
     audio::{open_capture_for_worker, AudioFrameSource},
-    config::AudioArgs,
+    config::AudioConfig,
 };
 
 pub const PIPEWIRE_DEFAULT_DEVICE_ID: &str = "pipewire";
@@ -61,7 +61,7 @@ pub(crate) trait AudioDeviceProvider: Send {
     fn open_capture(
         &mut self,
         device_id: &str,
-        args: &AudioArgs,
+        args: &AudioConfig,
     ) -> Result<OpenedAudioCapture, AudioDeviceUnavailable>;
 }
 
@@ -105,7 +105,7 @@ impl AudioDeviceProvider for AlsaAudioDeviceProvider {
     fn open_capture(
         &mut self,
         device_id: &str,
-        args: &AudioArgs,
+        args: &AudioConfig,
     ) -> Result<OpenedAudioCapture, AudioDeviceUnavailable> {
         let mut selected_args = args.clone();
         selected_args.device = device_id.to_owned();
