@@ -15,3 +15,9 @@ midir = "0.11"
 rustfft = "6.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+gpui = { git = "https://github.com/zed-industries/zed", rev = "90731bdec056817dd6dc53c6af56f016b9ec0655" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "90731bdec056817dd6dc53c6af56f016b9ec0655", default-features = false, features = ["font-kit", "wayland", "x11"] }
+
+[[bin]]
+name = "pss2midi-gui"
+path = "src/bin/pss2midi_gui.rs"
