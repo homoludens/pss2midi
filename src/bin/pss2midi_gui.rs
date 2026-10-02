@@ -9,6 +9,8 @@ mod live;
 #[allow(dead_code)]
 #[path = "pss2midi_gui/piano.rs"]
 mod piano;
+#[path = "pss2midi_gui/settings.rs"]
+mod settings;
 #[path = "pss2midi_gui/shell.rs"]
 mod shell;
 #[allow(dead_code)]

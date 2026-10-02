@@ -17,7 +17,7 @@
 - [x] 2.4 Build the Live view from actual engine state, including dominant note, latency, levels, YIN/spectral results, disagreement, top three matches, recent events, and keyboard highlights; verify displayed values update from test engine events.
 - [x] 2.5 Add Start/Stop, audio-device selection/retry, detector-mode controls, and MIDI output status to the UI; verify controls issue engine commands and reflect success and recoverable errors.
 - [x] 2.6 Build the Calibration view with requested note/sample progress, quality feedback, retry/cancel actions, and completed/current/remaining keyboard states; verify UI state across accepted, rejected, retried, and canceled samples.
-- [ ] 2.7 Build the Settings view for audio, detector, spectral, MIDI status, and collapsed advanced controls; verify edits are reflected in `AppConfig` and survive serialization/reload.
+- [x] 2.7 Build the Settings view for audio, detector, spectral, MIDI status, and collapsed advanced controls; verify edits are reflected in `AppConfig` and survive serialization/reload.
 
 ## 3. Startup and workflow integration
 

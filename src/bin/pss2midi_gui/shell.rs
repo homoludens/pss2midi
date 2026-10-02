@@ -1,15 +1,19 @@
-use std::time::{Duration, Instant};
+use std::{
+    ops::Range,
+    time::{Duration, Instant},
+};
 
 use gpui::{
-    div, prelude::*, px, rgb, size, App, Context, FontWeight, Render, Task, Window, WindowBounds,
-    WindowOptions,
+    div, prelude::*, px, rgb, size, App, Context, CursorStyle, FocusHandle, FontWeight,
+    KeyDownEvent, MouseButton, Render, Task, Window, WindowBounds, WindowOptions,
 };
 use pss2midi::{
     engine::{
+        app_config::AppConfig,
         calibration::{CalibrationRejectionReason, CalibrationSampleQuality},
         config::DetectorMode,
         note::note_name,
-        EngineEvent, EngineState, PssEngine,
+        save_config, EngineCommand, EngineEvent, EngineState, PssEngine,
     },
     ui::state::{
         engine_command_for_action, AppState, CalibrationStatus, ErrorKind, LiveControlAction,
@@ -26,6 +30,9 @@ use crate::{
     },
     live::{audio_device_choices, AudioDeviceChoice, DetectorAgreement, LiveViewModel},
     piano::PianoKeyboard,
+    settings::{
+        apply_text_edit, SettingField, SettingsViewModel, ADVANCED_SETTINGS_EXPANDED_BY_DEFAULT,
+    },
     theme,
 };
 
@@ -37,19 +44,107 @@ struct Pss2MidiApp {
     state: AppState,
     show_log: bool,
     audio_device_menu_open: bool,
+    advanced_settings_expanded: bool,
+    settings_text_edit: Option<SettingsTextEdit>,
+    settings_focus_handle: FocusHandle,
+    settings_save_sender: async_channel::Sender<ConfigSaveRequest>,
+    settings_save_revision: u64,
+    settings_save_task: Option<Task<()>>,
+    settings_error: Option<String>,
+    settings_saved: bool,
     event_task: Option<Task<()>>,
     engine: Option<PssEngine>,
 }
 
+struct ConfigSaveRequest {
+    revision: u64,
+    config: AppConfig,
+}
+
+struct SettingsTextEdit {
+    field: SettingField,
+    text: String,
+    cursor: usize,
+    selection: Option<Range<usize>>,
+}
+
+impl SettingsTextEdit {
+    fn new(field: SettingField, text: String) -> Self {
+        let cursor = text.len();
+        Self {
+            field,
+            text,
+            cursor,
+            selection: None,
+        }
+    }
+
+    fn replace_selection(&mut self, replacement: &str) -> bool {
+        let range = self.selection.take().unwrap_or(self.cursor..self.cursor);
+        if range.start > range.end || range.end > self.text.len() {
+            return false;
+        }
+        self.text.replace_range(range.clone(), replacement);
+        self.cursor = range.start + replacement.len();
+        self.selection = None;
+        true
+    }
+}
+
 impl Pss2MidiApp {
     fn new(cx: &mut Context<Self>) -> Self {
+        let (settings_save_sender, settings_save_receiver) = async_channel::unbounded();
         let mut app = Self {
             state: AppState::default(),
             show_log: true,
             audio_device_menu_open: false,
+            advanced_settings_expanded: ADVANCED_SETTINGS_EXPANDED_BY_DEFAULT,
+            settings_text_edit: None,
+            settings_focus_handle: cx.focus_handle(),
+            settings_save_sender,
+            settings_save_revision: 0,
+            settings_save_task: None,
+            settings_error: None,
+            settings_saved: false,
             event_task: None,
             engine: None,
         };
+
+        app.settings_save_task = Some(cx.spawn(async move |this, cx| {
+            while let Ok(mut request) = settings_save_receiver.recv().await {
+                while let Ok(newer_request) = settings_save_receiver.try_recv() {
+                    request = newer_request;
+                }
+
+                let revision = request.revision;
+                let result = cx
+                    .background_spawn(async move {
+                        save_config(&request.config).map_err(|error| error.to_string())
+                    })
+                    .await;
+
+                if this
+                    .update(cx, |this, cx| {
+                        if this.settings_save_revision == revision {
+                            match result {
+                                Ok(()) => {
+                                    this.settings_error = None;
+                                    this.settings_saved = true;
+                                }
+                                Err(error) => {
+                                    this.settings_error = Some(error);
+                                    this.settings_saved = false;
+                                }
+                            }
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
 
         match PssEngine::new() {
             Ok(engine) => {
@@ -59,7 +154,11 @@ impl Pss2MidiApp {
                     while let Ok(event) = event_rx.recv().await {
                         if this
                             .update(cx, |this, cx| {
+                                let previous_config = this.state.config.clone();
                                 this.state.reduce_event(event, Instant::now());
+                                if this.state.config != previous_config {
+                                    this.queue_settings_save();
+                                }
                                 cx.notify();
                             })
                             .is_err()
@@ -112,6 +211,185 @@ impl Pss2MidiApp {
             cx.notify();
         }
     }
+
+    fn begin_settings_edit(
+        &mut self,
+        field: SettingField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = field.value(&self.state.config);
+        self.settings_text_edit = Some(SettingsTextEdit::new(field, text));
+        self.settings_focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn handle_settings_key(
+        &mut self,
+        field: SettingField,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .settings_text_edit
+            .as_ref()
+            .is_some_and(|edit| edit.field == field)
+        {
+            return;
+        }
+
+        let key = event.keystroke.key.to_ascii_lowercase();
+        let modified = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+        if modified && key == "a" {
+            if let Some(edit) = self.settings_text_edit.as_mut() {
+                edit.selection = Some(0..edit.text.len());
+                edit.cursor = edit.text.len();
+            }
+            cx.notify();
+            return;
+        }
+        if key == "enter" {
+            self.settings_text_edit = None;
+            cx.notify();
+            return;
+        }
+        if key == "escape" {
+            self.settings_text_edit = None;
+            self.settings_error = None;
+            cx.notify();
+            return;
+        }
+
+        let mut changed = false;
+        if let Some(edit) = self.settings_text_edit.as_mut() {
+            match key.as_str() {
+                "backspace" => {
+                    if edit.selection.is_none() && edit.cursor > 0 {
+                        let previous = previous_char_boundary(&edit.text, edit.cursor);
+                        edit.selection = Some(previous..edit.cursor);
+                    }
+                    changed = edit.replace_selection("");
+                }
+                "delete" => {
+                    if edit.selection.is_none() && edit.cursor < edit.text.len() {
+                        let next = next_char_boundary(&edit.text, edit.cursor);
+                        edit.selection = Some(edit.cursor..next);
+                    }
+                    changed = edit.replace_selection("");
+                }
+                "left" => {
+                    if let Some(selection) = edit.selection.take() {
+                        edit.cursor = selection.start;
+                    } else {
+                        edit.cursor = previous_char_boundary(&edit.text, edit.cursor);
+                    }
+                }
+                "right" => {
+                    if let Some(selection) = edit.selection.take() {
+                        edit.cursor = selection.end;
+                    } else {
+                        edit.cursor = next_char_boundary(&edit.text, edit.cursor);
+                    }
+                }
+                "home" => {
+                    edit.selection = None;
+                    edit.cursor = 0;
+                }
+                "end" => {
+                    edit.selection = None;
+                    edit.cursor = edit.text.len();
+                }
+                "v" if modified => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        changed =
+                            edit.replace_selection(&text.replace('\n', " ").replace('\r', " "));
+                    }
+                }
+                _ => {
+                    if !modified && !event.keystroke.modifiers.alt {
+                        if let Some(text) = event.keystroke.key_char.as_deref() {
+                            if !text.chars().any(char::is_control) {
+                                changed = edit.replace_selection(text);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if changed {
+            let text = self
+                .settings_text_edit
+                .as_ref()
+                .map(|edit| edit.text.clone())
+                .unwrap_or_default();
+            self.apply_settings_text(field, &text);
+        }
+        let _ = window;
+        cx.notify();
+    }
+
+    fn apply_settings_text(&mut self, field: SettingField, text: &str) {
+        match apply_text_edit(&self.state.config, field, text) {
+            Ok(config) => {
+                self.settings_error = None;
+                if config != self.state.config {
+                    let template_path =
+                        (field == SettingField::TemplatePath).then(|| config.template_path.clone());
+                    self.state.config = config;
+                    self.settings_saved = false;
+                    self.queue_settings_save();
+                    if let (Some(engine), Some(path)) = (self.engine.as_ref(), template_path) {
+                        if engine
+                            .send(EngineCommand::SetTemplatePath { path })
+                            .is_err()
+                        {
+                            self.settings_error = Some(
+                                "The engine worker is no longer accepting template settings"
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                self.settings_save_revision = self.settings_save_revision.wrapping_add(1);
+                self.settings_error = Some(error);
+                self.settings_saved = false;
+            }
+        }
+    }
+
+    fn queue_settings_save(&mut self) {
+        self.settings_save_revision = self.settings_save_revision.wrapping_add(1);
+        self.settings_saved = false;
+        if self
+            .settings_save_sender
+            .try_send(ConfigSaveRequest {
+                revision: self.settings_save_revision,
+                config: self.state.config.clone(),
+            })
+            .is_err()
+        {
+            self.settings_error = Some("Settings could not be queued for saving".to_owned());
+        }
+    }
+}
+
+fn previous_char_boundary(text: &str, cursor: usize) -> usize {
+    text[..cursor.min(text.len())]
+        .char_indices()
+        .next_back()
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+fn next_char_boundary(text: &str, cursor: usize) -> usize {
+    text.get(cursor..)
+        .and_then(|remaining| remaining.char_indices().nth(1))
+        .map(|(offset, _)| cursor + offset)
+        .unwrap_or(text.len())
 }
 
 impl Render for Pss2MidiApp {
@@ -262,42 +540,30 @@ impl Pss2MidiApp {
             )
     }
 
-    fn page_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (eyebrow, title, description, panel_title, panel_description, marker) =
-            match self.state.page {
-                Page::Live => (
-                    "MONITORING",
-                    "Live",
-                    "Live detection, input levels, and detector comparison.",
-                    "",
-                    "",
-                    "01",
-                ),
-                Page::Calibration => (
-                    "INSTRUMENT SETUP",
-                    "Calibration",
-                    "Prepare spectral note profiles for the Yamaha PSS-F30.",
-                    "Guided calibration",
-                    "Capture five accepted samples for each key from C2 through C5.",
-                    "02",
-                ),
-                Page::Settings => (
-                    "PREFERENCES",
-                    "Settings",
-                    "Configure audio, detector, and spectral preferences.",
-                    "Application settings",
-                    "Audio and detection preferences will be available here.",
-                    "03",
-                ),
-            };
+    fn page_content(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (eyebrow, title, description) = match self.state.page {
+            Page::Live => (
+                "MONITORING",
+                "Live",
+                "Live detection, input levels, and detector comparison.",
+            ),
+            Page::Calibration => (
+                "INSTRUMENT SETUP",
+                "Calibration",
+                "Prepare spectral note profiles for the Yamaha PSS-F30.",
+            ),
+            Page::Settings => (
+                "PREFERENCES",
+                "Settings",
+                "Configure audio, detector, spectral, and advanced preferences.",
+            ),
+        };
 
         let content = div().flex_1().min_h_0();
         let content = match self.state.page {
             Page::Live => content.child(self.live_dashboard(cx)),
             Page::Calibration => content.child(self.calibration_dashboard(cx)),
-            Page::Settings => {
-                content.child(placeholder_panel(panel_title, panel_description, marker))
-            }
+            Page::Settings => content.child(self.settings_dashboard(cx)),
         };
 
         div()
@@ -352,7 +618,12 @@ impl Pss2MidiApp {
                     .flex_col()
                     .gap(px(theme::SPACE_MD))
                     .pb(px(theme::SPACE_MD))
-                    .child(live_controls(&self.state, self.audio_device_menu_open, cx))
+                    .child(live_controls(
+                        &self.state,
+                        self.audio_device_menu_open,
+                        None,
+                        cx,
+                    ))
                     .child(
                         div()
                             .w_full()
@@ -470,61 +741,404 @@ impl Pss2MidiApp {
         page = page.child(content);
         page
     }
+
+    fn settings_dashboard(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = SettingsViewModel::from_state(&self.state, self.advanced_settings_expanded);
+        let mut content = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(theme::SPACE_MD))
+            .pb(px(theme::SPACE_MD));
+
+        if let Some(message) = &self.settings_error {
+            content = content.child(settings_error_banner(message));
+        } else if self.settings_saved {
+            content = content.child(settings_saved_banner());
+        }
+        let mut audio_panel = settings_panel(
+            "Audio and detector",
+            "Device and mode reflect the latest engine state; sample rate is saved for startup settings.",
+        )
+        .child(live_controls(
+            &self.state,
+            self.audio_device_menu_open,
+            Some(&view),
+            cx,
+        ));
+        audio_panel = audio_panel.child(settings_row(
+            "Sample rate",
+            "Requested capture rate · takes effect when settings are connected to engine startup.",
+            self.settings_text_field(
+                SettingField::SampleRate,
+                SettingField::SampleRate.value(&view.config),
+                cx,
+            ),
+        ));
+        content = content.child(audio_panel);
+
+        let template_panel = settings_panel(
+            "Spectral templates",
+            "Choose the editable template file used by future calibration runs.",
+        )
+        .child(settings_row(
+            "Template path",
+            "Template samples remain separate from the application settings file.",
+            self.settings_text_field(
+                SettingField::TemplatePath,
+                SettingField::TemplatePath.value(&view.config),
+                cx,
+            ),
+        ))
+        .child(
+            div()
+                .id("settings-recalibrate")
+                .flex_none()
+                .px(px(theme::SPACE_MD))
+                .py(px(theme::SPACE_SM))
+                .rounded_md()
+                .bg(rgb(theme::ACCENT_TINT))
+                .border_1()
+                .border_color(rgb(theme::ACCENT))
+                .text_size(px(theme::FONT_SMALL))
+                .text_color(rgb(theme::ACCENT))
+                .font_weight(FontWeight::SEMIBOLD)
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.state.select_page(Page::Calibration);
+                    cx.notify();
+                }))
+                .child("Recalibrate"),
+        );
+        content = content.child(template_panel);
+
+        let mut spectral_panel = settings_panel(
+            "Spectral detection",
+            "Tune when a spectral observation is taken and how matches are accepted.",
+        );
+        spectral_panel = spectral_panel
+            .child(settings_row(
+                "Delay",
+                "Milliseconds after onset before analyzing a note.",
+                self.settings_text_field(
+                    SettingField::SpectralDelay,
+                    SettingField::SpectralDelay.value(&view.config),
+                    cx,
+                ),
+            ))
+            .child(settings_row(
+                "Window",
+                "Audio window duration in milliseconds.",
+                self.settings_text_field(
+                    SettingField::SpectralWindow,
+                    SettingField::SpectralWindow.value(&view.config),
+                    cx,
+                ),
+            ))
+            .child(settings_row(
+                "Minimum score",
+                "Lowest template similarity accepted as a match (0–1).",
+                self.settings_text_field(
+                    SettingField::SpectralMinimumScore,
+                    SettingField::SpectralMinimumScore.value(&view.config),
+                    cx,
+                ),
+            ))
+            .child(settings_row(
+                "Minimum margin",
+                "Required lead over the next-ranked template (0–1).",
+                self.settings_text_field(
+                    SettingField::SpectralMinimumMargin,
+                    SettingField::SpectralMinimumMargin.value(&view.config),
+                    cx,
+                ),
+            ));
+        content = content.child(spectral_panel);
+
+        let midi_panel = settings_panel(
+            "MIDI output",
+            "Connection name and status are reported by the engine.",
+        )
+        .child(midi_output_badge(&view.midi_output_status));
+        content = content.child(midi_panel);
+
+        let advanced_header = div()
+            .id("settings-advanced-toggle")
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(theme::SPACE_SM))
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.advanced_settings_expanded = !this.advanced_settings_expanded;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .text_size(px(theme::FONT_SMALL))
+                    .text_color(rgb(theme::TEXT_PRIMARY))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Advanced"),
+            )
+            .child(
+                div()
+                    .text_size(px(theme::FONT_CAPTION))
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .child(if view.advanced_expanded {
+                        "Expanded · click to collapse"
+                    } else {
+                        "Collapsed · click to expand"
+                    }),
+            );
+        let mut advanced_panel = settings_panel(
+            "Advanced controls",
+            "FFT, onset, release/retrigger, YIN voting, and spectral analysis tuning.",
+        )
+        .child(advanced_header);
+        if view.advanced_expanded {
+            for (label, description, field) in [
+                (
+                    "FFT size",
+                    "Spectral transform size · power of two.",
+                    SettingField::FftSize,
+                ),
+                (
+                    "Hop size",
+                    "Samples processed between detector frames.",
+                    SettingField::HopSize,
+                ),
+                (
+                    "Onset buffer",
+                    "Frame size used by onset detection.",
+                    SettingField::OnsetBufferSize,
+                ),
+                (
+                    "Silence threshold",
+                    "Input level threshold in dBFS.",
+                    SettingField::SilenceDb,
+                ),
+                (
+                    "Release",
+                    "Silence duration before MIDI note-off, in milliseconds.",
+                    SettingField::ReleaseMs,
+                ),
+                (
+                    "Retrigger",
+                    "Minimum time between repeated attacks, in milliseconds.",
+                    SettingField::RetriggerMs,
+                ),
+                (
+                    "Onset threshold",
+                    "aubio onset peak threshold.",
+                    SettingField::OnsetThreshold,
+                ),
+                (
+                    "YIN pitch buffer",
+                    "aubio pitch analysis window size.",
+                    SettingField::PitchBufferSize,
+                ),
+                (
+                    "YIN attack ignore",
+                    "Ignore pitch estimates after onset, in milliseconds.",
+                    SettingField::AttackIgnoreMs,
+                ),
+                (
+                    "YIN decision window",
+                    "Collect pitch votes for this duration, in milliseconds.",
+                    SettingField::DecisionWindowMs,
+                ),
+                (
+                    "YIN decision extension",
+                    "Additional time for ambiguous pitch votes, in milliseconds.",
+                    SettingField::DecisionExtendMs,
+                ),
+                (
+                    "YIN vote ratio",
+                    "Fraction of valid pitch votes required for a winner.",
+                    SettingField::VoteRatio,
+                ),
+                (
+                    "YIN stable frames",
+                    "Stable frames required for initial pitch acquisition.",
+                    SettingField::InitialStableFrames,
+                ),
+            ] {
+                advanced_panel = advanced_panel.child(settings_row(
+                    label,
+                    description,
+                    self.settings_text_field(field, field.value(&view.config), cx),
+                ));
+            }
+        }
+        content = content.child(advanced_panel);
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .id("settings-dashboard-scroll")
+            .overflow_y_scroll()
+            .child(content)
+    }
+
+    fn settings_text_field(
+        &self,
+        field: SettingField,
+        value: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active_edit = self
+            .settings_text_edit
+            .as_ref()
+            .filter(|edit| edit.field == field);
+        let is_active = active_edit.is_some();
+        let display_value = active_edit.map_or(value.clone(), |edit| {
+            let mut display = edit.text.clone();
+            display.insert(edit.cursor, '▏');
+            display
+        });
+        let focus_handle = self.settings_focus_handle.clone();
+
+        div()
+            .id(format!("settings-input-{}", field.id()))
+            .track_focus(&focus_handle)
+            .w(px(280.0))
+            .max_w(px(360.0))
+            .flex_none()
+            .px(px(theme::SPACE_SM))
+            .py(px(theme::SPACE_SM))
+            .rounded_md()
+            .bg(rgb(theme::PANEL_INSET))
+            .border_1()
+            .border_color(rgb(if is_active {
+                theme::ACCENT
+            } else {
+                theme::BORDER
+            }))
+            .text_size(px(theme::FONT_SMALL))
+            .text_color(rgb(if is_active {
+                theme::TEXT_PRIMARY
+            } else {
+                theme::TEXT_SECONDARY
+            }))
+            .cursor(CursorStyle::IBeam)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    this.begin_settings_edit(field, window, cx);
+                }),
+            )
+            .on_key_down(cx.listener(move |this, event, window, cx| {
+                this.handle_settings_key(field, event, window, cx);
+            }))
+            .child(display_value)
+    }
 }
 
-fn placeholder_panel(
-    title: &'static str,
-    description: &'static str,
-    marker: &'static str,
-) -> impl IntoElement {
+fn settings_panel(title: &'static str, description: &'static str) -> gpui::Div {
     div()
-        .flex_1()
-        .min_h_0()
+        .w_full()
         .flex()
         .flex_col()
-        .items_center()
-        .justify_center()
         .gap(px(theme::SPACE_MD))
-        .p(px(theme::SPACE_XL))
-        .rounded_lg()
+        .p(px(theme::SPACE_MD))
+        .rounded_md()
         .bg(rgb(theme::PANEL))
         .border_1()
         .border_color(rgb(theme::BORDER))
         .child(
             div()
-                .size(px(52.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_lg()
-                .bg(rgb(theme::PANEL_INSET))
-                .text_size(px(theme::FONT_BODY))
-                .text_color(rgb(theme::ACCENT))
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(marker),
-        )
-        .child(
-            div()
-                .text_size(px(theme::FONT_TITLE))
+                .text_size(px(theme::FONT_SMALL))
+                .text_color(rgb(theme::TEXT_PRIMARY))
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(title),
         )
         .child(
             div()
-                .text_size(px(theme::FONT_BODY))
+                .text_size(px(theme::FONT_CAPTION))
                 .text_color(rgb(theme::TEXT_SECONDARY))
                 .child(description),
         )
+}
+
+fn settings_row(
+    label: &'static str,
+    description: &'static str,
+    control: impl IntoElement,
+) -> impl IntoElement {
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(theme::SPACE_MD))
+        .px(px(theme::SPACE_SM))
+        .py(px(theme::SPACE_XS))
         .child(
             div()
-                .mt(px(theme::SPACE_SM))
-                .px(px(theme::SPACE_MD))
-                .py(px(theme::SPACE_SM))
-                .rounded_md()
-                .bg(rgb(theme::PANEL_INSET))
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(theme::SPACE_XS))
+                .child(
+                    div()
+                        .text_size(px(theme::FONT_SMALL))
+                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_size(px(theme::FONT_CAPTION))
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(description),
+                ),
+        )
+        .child(control)
+}
+
+fn settings_error_banner(message: &str) -> impl IntoElement {
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .gap(px(theme::SPACE_SM))
+        .px(px(theme::SPACE_MD))
+        .py(px(theme::SPACE_SM))
+        .rounded_md()
+        .bg(rgb(theme::ERROR_TINT))
+        .border_1()
+        .border_color(rgb(theme::ERROR))
+        .child(StatusBadge::new("SETTINGS ERROR", StatusTone::Error).render())
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(px(theme::FONT_SMALL))
+                .text_color(rgb(theme::ERROR))
+                .child(message.to_owned()),
+        )
+}
+
+fn settings_saved_banner() -> impl IntoElement {
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .gap(px(theme::SPACE_SM))
+        .px(px(theme::SPACE_MD))
+        .py(px(theme::SPACE_SM))
+        .rounded_md()
+        .bg(rgb(theme::SUCCESS_TINT))
+        .border_1()
+        .border_color(rgb(theme::SUCCESS))
+        .child(StatusBadge::new("SAVED", StatusTone::Success).render())
+        .child(
+            div()
                 .text_size(px(theme::FONT_CAPTION))
-                .text_color(rgb(theme::TEXT_MUTED))
-                .child("PAGE PLACEHOLDER"),
+                .text_color(rgb(theme::TEXT_SECONDARY))
+                .child("Settings saved to ~/.config/pss2midi/config.json"),
         )
 }
 
@@ -1460,14 +2074,22 @@ fn format_latency(latency: Duration) -> String {
 fn live_controls(
     state: &AppState,
     audio_device_menu_open: bool,
+    settings_view: Option<&SettingsViewModel>,
     cx: &mut Context<Pss2MidiApp>,
 ) -> impl IntoElement {
-    let choices = audio_device_choices(&state.audio_devices, &state.selected_audio_device);
+    let selected_device = settings_view
+        .map(|view| view.selected_audio_device.as_str())
+        .unwrap_or(&state.selected_audio_device);
+    let choices = settings_view.map_or_else(
+        || audio_device_choices(&state.audio_devices, selected_device),
+        |view| view.audio_choices.clone(),
+    );
+    let detector_mode = settings_view.map_or(state.config.detector_mode, |view| view.detector_mode);
     let selected_label = choices
         .iter()
         .find(|choice| choice.selected)
         .map(|choice| choice.label.clone())
-        .unwrap_or_else(|| state.selected_audio_device.clone());
+        .unwrap_or_else(|| selected_device.to_owned());
     let (audio_status, audio_tone) = if state.audio_device_open {
         ("OPEN", StatusTone::Success)
     } else if state.error_banner.as_ref().is_some_and(|error| {
@@ -1512,10 +2134,7 @@ fn live_controls(
                         .min_w_0()
                         .text_size(px(theme::FONT_SMALL))
                         .text_color(rgb(theme::TEXT_PRIMARY))
-                        .child(format!(
-                            "{selected_label} · {}",
-                            state.selected_audio_device
-                        )),
+                        .child(format!("{selected_label} · {}", selected_device)),
                 )
                 .child(
                     div()
@@ -1626,19 +2245,15 @@ fn live_controls(
                         .flex()
                         .flex_wrap()
                         .gap(px(theme::SPACE_XS))
-                        .child(detector_mode_choice(
-                            DetectorMode::Yin,
-                            state.config.detector_mode,
-                            cx,
-                        ))
+                        .child(detector_mode_choice(DetectorMode::Yin, detector_mode, cx))
                         .child(detector_mode_choice(
                             DetectorMode::Spectral,
-                            state.config.detector_mode,
+                            detector_mode,
                             cx,
                         ))
                         .child(detector_mode_choice(
                             DetectorMode::Compare,
-                            state.config.detector_mode,
+                            detector_mode,
                             cx,
                         )),
                 ),
