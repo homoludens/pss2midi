@@ -10,7 +10,7 @@ use pss2midi::engine::{
     audio::open_capture,
     calibration,
     config::{Cli, Commands, DetectorMode, RunArgs},
-    detector::Detector,
+    detector::{Detector, NoteDecision},
     midi::Midi,
 };
 
@@ -46,7 +46,8 @@ fn run(args: RunArgs) -> Result<()> {
                     frame[frame_fill] = sample as f32 / 32768.0;
                     frame_fill += 1;
                     if frame_fill == hop {
-                        detector.process(&frame, &mut midi)?;
+                        let outcome = detector.process(&frame)?;
+                        apply_note_decisions(&mut midi, outcome.note_decisions)?;
                         frame_fill = 0;
                     }
                 }
@@ -58,8 +59,18 @@ fn run(args: RunArgs) -> Result<()> {
         }
     }
 
-    detector.shutdown(&mut midi)?;
+    apply_note_decisions(&mut midi, detector.shutdown())?;
     println!("Stopped.");
+    Ok(())
+}
+
+fn apply_note_decisions(midi: &mut Midi, decisions: Vec<NoteDecision>) -> Result<()> {
+    for decision in decisions {
+        match decision {
+            NoteDecision::NoteOn { note } => midi.note_on(note)?,
+            NoteDecision::NoteOff { note } => midi.note_off(note)?,
+        }
+    }
     Ok(())
 }
 

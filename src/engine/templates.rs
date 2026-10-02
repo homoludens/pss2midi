@@ -20,12 +20,19 @@ pub struct TemplateFile {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RankedMatch {
+    pub note: u8,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Classification {
     pub note: u8,
     pub score: f32,
     pub second_score: f32,
     pub margin: f32,
     pub accepted: bool,
+    pub ranked_matches: Vec<RankedMatch>,
 }
 
 impl TemplateFile {
@@ -153,12 +160,21 @@ impl TemplateFile {
         let (note, score) = scores[0];
         let second_score = scores[1].1;
         let margin = score - second_score;
+        let ranked_matches = scores
+            .iter()
+            .take(3)
+            .map(|(note, score)| RankedMatch {
+                note: *note,
+                score: *score,
+            })
+            .collect();
         Ok(Classification {
             note,
             score,
             second_score,
             margin,
             accepted: score >= minimum_score && margin >= minimum_margin,
+            ranked_matches,
         })
     }
 }
@@ -242,6 +258,44 @@ mod tests {
             .classify(&[0.9, 0.4358899, 0.0], 0.75, 0.2)
             .unwrap();
         assert!(!ambiguous.accepted);
+    }
+
+    #[test]
+    fn classifier_returns_the_three_highest_ranked_matches() {
+        let mut templates = TemplateFile::empty(48_000, 2048, 30.0, 8.0);
+        for note in MIN_MIDI..=MAX_MIDI {
+            templates
+                .notes
+                .insert(note as u8, vec![vec![0.0, 1.0, 0.0, 0.0]]);
+        }
+        templates.notes.insert(48, vec![vec![1.0, 0.0, 0.0, 0.0]]);
+        templates.notes.insert(49, vec![vec![0.8, 0.6, 0.0, 0.0]]);
+        templates.notes.insert(50, vec![vec![0.6, 0.8, 0.0, 0.0]]);
+        templates
+            .notes
+            .insert(51, vec![vec![0.2, 0.0, 0.9797959, 0.0]]);
+
+        let result = templates
+            .classify(&[1.0, 0.0, 0.0, 0.0], 0.75, 0.03)
+            .unwrap();
+
+        assert_eq!(
+            result.ranked_matches,
+            vec![
+                RankedMatch {
+                    note: 48,
+                    score: 1.0,
+                },
+                RankedMatch {
+                    note: 49,
+                    score: 0.8,
+                },
+                RankedMatch {
+                    note: 50,
+                    score: 0.6,
+                },
+            ]
+        );
     }
 
     #[test]

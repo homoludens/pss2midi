@@ -4,16 +4,114 @@ use std::time::{Duration, Instant};
 use anyhow::{ensure, Result};
 use aubio::{Pitch, PitchMode, PitchUnit};
 
+pub use crate::engine::templates::RankedMatch;
+
 use crate::engine::{
     config::{default_template_path, DetectorMode, RunArgs},
     features::{FeatureExtractor, SampleCapture, SampleHistory},
-    midi::Midi,
     note::{ms_to_hops, note_name, quantize_pitch, rms_db, MIN_MIDI, NOTE_COUNT},
     onset::OnsetDetector,
     templates::{validate_for_extractor, Classification, TemplateFile},
 };
 
 const FALLBACK_ATTACK_MARGIN_DB: f32 = 10.0;
+
+/// A note-on/off decision produced by DSP and applied by the owning caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoteDecision {
+    NoteOn { note: u8 },
+    NoteOff { note: u8 },
+}
+
+/// Confidence in a completed YIN onset decision, based on actual pitch votes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct YinDecision {
+    pub candidate_note: Option<u8>,
+    pub accepted: bool,
+    pub vote_count: usize,
+    pub total_votes: usize,
+    pub vote_ratio: Option<f32>,
+}
+
+/// YIN's current pitch estimate and, when completed, its onset-vote decision.
+#[derive(Clone, Debug, PartialEq)]
+pub struct YinResult {
+    /// Aubio's pitch estimate in MIDI units, absent when aubio reports no pitch.
+    pub midi_pitch: Option<f32>,
+    /// Quantized MIDI note when the estimate is within the supported range/tolerance.
+    pub note: Option<u8>,
+    pub cents: Option<f32>,
+    pub decision: Option<YinDecision>,
+}
+
+impl YinResult {
+    fn from_pitch(midi_pitch: f32, detected: Option<(u8, f32)>) -> Self {
+        Self {
+            midi_pitch: (midi_pitch.is_finite() && midi_pitch > 0.0).then_some(midi_pitch),
+            note: detected.map(|(note, _)| note),
+            cents: detected.map(|(_, cents)| cents),
+            decision: None,
+        }
+    }
+}
+
+/// Spectral classification data from the detector's existing template scores.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpectralResult {
+    /// Top-ranked classifier candidate, including when it is rejected by thresholds.
+    pub note: u8,
+    pub confidence: f32,
+    pub second_score: f32,
+    pub margin: f32,
+    pub accepted: bool,
+    /// Accepted spectral note selected for output, absent when rejected/suppressed.
+    pub selected_note: Option<u8>,
+    pub ranked_matches: Vec<RankedMatch>,
+}
+
+impl SpectralResult {
+    fn from_classification(classification: Classification) -> Self {
+        let selected_note = classification.accepted.then_some(classification.note);
+        Self {
+            note: classification.note,
+            confidence: classification.score,
+            second_score: classification.second_score,
+            margin: classification.margin,
+            accepted: classification.accepted,
+            selected_note,
+            ranked_matches: classification.ranked_matches,
+        }
+    }
+}
+
+/// GPUI-independent values produced by one detector processing step.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DetectorOutcome {
+    pub onset_detected: bool,
+    pub selected_note: Option<u8>,
+    /// Ordered MIDI actions; replacements contain NoteOff before NoteOn.
+    pub note_decisions: Vec<NoteDecision>,
+    pub yin: Option<YinResult>,
+    pub spectral: Option<SpectralResult>,
+    pub onset_to_note_latency: Option<Duration>,
+    pub rms_dbfs: f32,
+    pub peak: f32,
+}
+
+impl DetectorOutcome {
+    fn new(rms_dbfs: f32, peak: f32) -> Self {
+        Self {
+            onset_detected: false,
+            selected_note: None,
+            note_decisions: Vec::new(),
+            yin: None,
+            spectral: None,
+            onset_to_note_latency: None,
+            rms_dbfs,
+            peak,
+        }
+    }
+}
 
 struct PendingDecision {
     onset_at: Instant,
@@ -65,6 +163,17 @@ impl PendingDecision {
             *count,
             *count as f32 / self.total_votes as f32,
         ))
+    }
+
+    fn result(&self, required_ratio: f32) -> YinDecision {
+        let winner = self.winner();
+        YinDecision {
+            candidate_note: winner.map(|(note, _, _)| note),
+            accepted: winner.is_some_and(|(_, count, ratio)| count >= 2 && ratio >= required_ratio),
+            vote_count: winner.map_or(0, |(_, count, _)| count as usize),
+            total_votes: self.total_votes as usize,
+            vote_ratio: winner.map(|(_, _, ratio)| ratio),
+        }
     }
 }
 
@@ -232,28 +341,28 @@ impl Detector {
         &mut self,
         note: u8,
         onset_time: Option<Instant>,
-        midi: &mut Midi,
-    ) -> Result<()> {
+    ) -> (Vec<NoteDecision>, Option<Duration>) {
         let now = Instant::now();
+        let mut decisions = Vec::with_capacity(2);
         match self.current_note {
             None => {
-                midi.note_on(note)?;
+                decisions.push(NoteDecision::NoteOn { note });
                 self.current_note = Some(note);
                 self.last_trigger = Some(now);
             }
             Some(current) if current == note => {
                 let Some(onset_time) = onset_time else {
-                    return Ok(());
+                    return (decisions, None);
                 };
                 let cooldown_ok = self
                     .last_trigger
                     .map(|last| now.duration_since(last) >= self.retrigger_time)
                     .unwrap_or(true);
                 if !cooldown_ok {
-                    return Ok(());
+                    return (decisions, None);
                 }
-                midi.note_off(note)?;
-                midi.note_on(note)?;
+                decisions.push(NoteDecision::NoteOff { note });
+                decisions.push(NoteDecision::NoteOn { note });
                 self.last_trigger = Some(now);
                 self.debug(format!(
                     "same-note retrigger {} ; onset->MIDI {:.1} ms",
@@ -262,8 +371,8 @@ impl Detector {
                 ));
             }
             Some(current) => {
-                midi.note_off(current)?;
-                midi.note_on(note)?;
+                decisions.push(NoteDecision::NoteOff { note: current });
+                decisions.push(NoteDecision::NoteOn { note });
                 self.current_note = Some(note);
                 self.last_trigger = Some(now);
                 if let Some(onset_time) = onset_time {
@@ -276,13 +385,21 @@ impl Detector {
                 }
             }
         }
-        Ok(())
+        let emitted_note_on = decisions
+            .iter()
+            .any(|decision| matches!(decision, NoteDecision::NoteOn { .. }));
+        let latency = emitted_note_on
+            .then(|| onset_time.map(|onset_time| now.duration_since(onset_time)))
+            .flatten();
+        (decisions, latency)
     }
 
-    fn release(&mut self, midi: &mut Midi) -> Result<()> {
-        if let Some(note) = self.current_note.take() {
-            midi.note_off(note)?;
-        }
+    fn release(&mut self) -> Vec<NoteDecision> {
+        let decisions = self
+            .current_note
+            .take()
+            .map(|note| vec![NoteDecision::NoteOff { note }])
+            .unwrap_or_default();
         self.pending_yin = None;
         if self.mode == DetectorMode::Compare {
             if let Some(pending) = self.pending_spectral.as_mut() {
@@ -294,10 +411,15 @@ impl Detector {
             self.pending_spectral = None;
         }
         self.clear_fallback();
-        Ok(())
+        decisions
     }
 
-    pub fn process(&mut self, frame: &[f32], midi: &mut Midi) -> Result<()> {
+    fn complete_outcome(&self, mut outcome: DetectorOutcome) -> DetectorOutcome {
+        outcome.selected_note = self.current_note;
+        outcome
+    }
+
+    pub fn process(&mut self, frame: &[f32]) -> Result<DetectorOutcome> {
         let frame_start = self.sample_index;
         self.sample_index += frame.len() as u64;
         if self.mode != DetectorMode::Yin {
@@ -305,16 +427,31 @@ impl Detector {
         }
         let now = Instant::now();
         let level = rms_db(frame);
+        let peak = frame
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+        let mut outcome = DetectorOutcome::new(level, peak);
         let pitch_value = if let Some(pitch) = self.pitch.as_mut() {
             pitch.do_result(frame)?
         } else {
             -1.0
         };
         let detected = quantize_pitch(pitch_value);
+        if self.pitch.is_some() {
+            outcome.yin = Some(YinResult::from_pitch(pitch_value, detected));
+        }
         let onset_detected = self.onset.detect(frame)?;
 
         if self.mode == DetectorMode::Yin {
-            return self.process_yin(level, pitch_value, detected, onset_detected, now, midi);
+            self.process_yin(
+                level,
+                pitch_value,
+                detected,
+                onset_detected,
+                now,
+                &mut outcome,
+            )?;
+            return Ok(self.complete_outcome(outcome));
         }
 
         let is_silent = level < self.silence_db;
@@ -322,7 +459,7 @@ impl Detector {
             self.silence_count += 1;
             self.clear_fallback();
             if self.silence_count >= self.release_hops {
-                self.release(midi)?;
+                outcome.note_decisions.extend(self.release());
             }
             self.debug(format!("level={level:6.1} dB silence"));
         } else {
@@ -331,6 +468,7 @@ impl Detector {
 
         let new_attack = onset_detected && !is_silent;
         if new_attack {
+            outcome.onset_detected = true;
             let capture = SampleCapture::new(
                 frame_start + self.spectral_delay_samples,
                 self.spectral_window_samples,
@@ -357,7 +495,13 @@ impl Detector {
             if let Some(yin_result) = self.advance_yin_decision(detected) {
                 if let Some(pending) = self.pending_spectral.as_mut() {
                     pending.yin_ready = true;
-                    pending.yin_note = yin_result;
+                    pending.yin_note = yin_result
+                        .accepted
+                        .then_some(yin_result.candidate_note)
+                        .flatten();
+                }
+                if let Some(yin) = outcome.yin.as_mut() {
+                    yin.decision = Some(yin_result);
                 }
             }
         }
@@ -389,19 +533,19 @@ impl Detector {
             }
 
             let compare_waiting_for_yin = self.mode == DetectorMode::Compare && !pending.yin_ready;
-            if let Some(classification) = pending.classification {
+            if let Some(classification) = pending.classification.take() {
                 if compare_waiting_for_yin {
                     pending.classification = Some(classification);
                     self.pending_spectral = Some(pending);
                 } else {
-                    self.finish_spectral_decision(pending, classification, midi)?;
+                    self.finish_spectral_decision(pending, classification, &mut outcome)?;
                 }
             } else {
                 self.pending_spectral = Some(pending);
             }
         }
 
-        Ok(())
+        Ok(self.complete_outcome(outcome))
     }
 
     fn process_yin(
@@ -411,13 +555,13 @@ impl Detector {
         detected: Option<(u8, f32)>,
         onset_detected: bool,
         now: Instant,
-        midi: &mut Midi,
+        outcome: &mut DetectorOutcome,
     ) -> Result<()> {
         if level < self.silence_db {
             self.silence_count += 1;
             self.clear_fallback();
             if self.silence_count >= self.release_hops {
-                self.release(midi)?;
+                outcome.note_decisions.extend(self.release());
             }
             self.debug(format!("level={level:6.1} dB silence"));
             return Ok(());
@@ -425,6 +569,7 @@ impl Detector {
         self.silence_count = 0;
 
         if onset_detected {
+            outcome.onset_detected = true;
             self.pending_yin = Some(PendingDecision::new(
                 now,
                 self.attack_ignore_hops,
@@ -452,18 +597,28 @@ impl Detector {
                 return Ok(());
             }
 
-            let decision = pending.winner();
+            let decision = pending.result(self.vote_ratio);
             let onset_at = pending.onset_at;
-            if let Some((winner, count, ratio)) = decision {
+            if let Some(winner) = decision.candidate_note {
                 self.debug(format!(
-                    "decision {} votes={count} ratio={ratio:.2}",
-                    note_name(winner)
+                    "decision {} votes={} ratio={:.2}",
+                    note_name(winner),
+                    decision.vote_count,
+                    decision.vote_ratio.unwrap_or_default(),
                 ));
-                if count >= 2 && ratio >= self.vote_ratio {
-                    self.send_new_note(winner, Some(onset_at), midi)?;
-                    self.clear_fallback();
-                    return Ok(());
+            }
+            if decision.accepted {
+                let winner = decision
+                    .candidate_note
+                    .expect("an accepted YIN decision has a candidate note");
+                if let Some(yin) = outcome.yin.as_mut() {
+                    yin.decision = Some(decision);
                 }
+                let (actions, latency) = self.send_new_note(winner, Some(onset_at));
+                outcome.note_decisions.extend(actions);
+                outcome.onset_to_note_latency = latency;
+                self.clear_fallback();
+                return Ok(());
             }
             if pending.extensions_left > 0 {
                 pending.extensions_left -= 1;
@@ -471,6 +626,9 @@ impl Detector {
                 self.pending_yin = Some(pending);
                 self.debug("ambiguous onset; extending decision window");
                 return Ok(());
+            }
+            if let Some(yin) = outcome.yin.as_mut() {
+                yin.decision = Some(decision);
             }
             self.debug("onset decision rejected");
             return Ok(());
@@ -508,7 +666,9 @@ impl Detector {
             self.initial_stable
         ));
         if self.fallback_count >= self.initial_stable {
-            self.send_new_note(note, None, midi)?;
+            let (actions, latency) = self.send_new_note(note, None);
+            outcome.note_decisions.extend(actions);
+            outcome.onset_to_note_latency = latency;
             self.clear_fallback();
         }
         Ok(())
@@ -516,7 +676,7 @@ impl Detector {
 
     /// Runs only as a diagnostic companion in compare mode.
     /// It shares the existing YIN onset vote rules and never drives MIDI.
-    fn advance_yin_decision(&mut self, detected: Option<(u8, f32)>) -> Option<Option<u8>> {
+    fn advance_yin_decision(&mut self, detected: Option<(u8, f32)>) -> Option<YinDecision> {
         let mut pending = self.pending_yin.take()?;
         if pending.ignore_left > 0 {
             pending.ignore_left -= 1;
@@ -531,10 +691,9 @@ impl Detector {
             self.pending_yin = Some(pending);
             return None;
         }
-        if let Some((note, count, ratio)) = pending.winner() {
-            if count >= 2 && ratio >= self.vote_ratio {
-                return Some(Some(note));
-            }
+        let decision = pending.result(self.vote_ratio);
+        if decision.accepted {
+            return Some(decision);
         }
         if pending.extensions_left > 0 {
             pending.extensions_left -= 1;
@@ -542,14 +701,14 @@ impl Detector {
             self.pending_yin = Some(pending);
             return None;
         }
-        Some(None)
+        Some(decision)
     }
 
     fn finish_spectral_decision(
         &mut self,
         pending: PendingSpectral,
         classification: Classification,
-        midi: &mut Midi,
+        outcome: &mut DetectorOutcome,
     ) -> Result<()> {
         let spectral_note = classification.accepted.then_some(classification.note);
         let released_before_result =
@@ -571,39 +730,6 @@ impl Detector {
                         .or_default() += 1;
                 }
             }
-
-            let yin_display = if pending.yin_ready {
-                pending
-                    .yin_note
-                    .map(|note| format!("{}({note})", note_name(note)))
-                    .unwrap_or_else(|| "rejected".to_owned())
-            } else {
-                "pending/none".to_owned()
-            };
-            let spectral_display = if classification.accepted {
-                format!(
-                    "{}({})",
-                    note_name(classification.note),
-                    classification.note
-                )
-            } else {
-                "rejected".to_owned()
-            };
-            let result_display = if released_before_result {
-                "suppressed: silence".to_owned()
-            } else {
-                spectral_note
-                    .map(|note| format!("{}({note})", note_name(note)))
-                    .unwrap_or_else(|| "none".to_owned())
-            };
-            println!(
-                "[{:10.2} ms] compare: YIN={yin_display} SPECTRAL={spectral_display} score={:.3} second={:.3} margin={:.3} AGREE={} RESULT={result_display}",
-                self.started_at.elapsed().as_secs_f64() * 1000.0,
-                classification.score,
-                classification.second_score,
-                classification.margin,
-                pending.yin_ready && pending.yin_note == spectral_note,
-            );
         }
 
         self.debug(format!(
@@ -621,16 +747,22 @@ impl Detector {
         ));
         if released_before_result {
             self.debug("discarding spectral result after sustained silence");
+            let mut spectral = SpectralResult::from_classification(classification);
+            spectral.selected_note = None;
+            outcome.spectral = Some(spectral);
             return Ok(());
         }
         if let Some(note) = spectral_note {
-            self.send_new_note(note, Some(pending.onset_at), midi)?;
+            let (actions, latency) = self.send_new_note(note, Some(pending.onset_at));
+            outcome.note_decisions.extend(actions);
+            outcome.onset_to_note_latency = latency;
         }
+        outcome.spectral = Some(SpectralResult::from_classification(classification));
         Ok(())
     }
 
-    pub fn shutdown(&mut self, midi: &mut Midi) -> Result<()> {
-        self.release(midi)?;
+    pub fn shutdown(&mut self) -> Vec<NoteDecision> {
+        let decisions = self.release();
         if self.mode == DetectorMode::Compare {
             println!(
                 "Compare summary: events={} agree={} disagree={} spectral_rejected={}",
@@ -648,13 +780,20 @@ impl Detector {
                 );
             }
         }
-        Ok(())
+        decisions
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::config::Cli;
+    use clap::Parser;
+
+    fn yin_detector() -> Detector {
+        let args = Cli::try_parse_from(["pss2midi"]).unwrap().run;
+        Detector::new(&args, args.audio.sample_rate, args.audio.hop).unwrap()
+    }
 
     fn decision(notes: &[u8]) -> Option<u8> {
         let mut pending = PendingDecision::new(Instant::now(), 0, notes.len(), 0);
@@ -677,5 +816,90 @@ mod tests {
     #[test]
     fn transient_does_not_dominate() {
         assert_eq!(decision(&[48, 48, 40, 72, 48, 48]), Some(48));
+    }
+
+    #[test]
+    fn completed_yin_result_reports_vote_count_ratio_and_acceptance() {
+        let mut pending = PendingDecision::new(Instant::now(), 0, 4, 0);
+        for note in [48, 48, 49, 48] {
+            pending.vote(note);
+        }
+
+        let result = pending.result(0.6);
+        assert_eq!(result.candidate_note, Some(48));
+        assert!(result.accepted);
+        assert_eq!(result.vote_count, 3);
+        assert_eq!(result.total_votes, 4);
+        assert_eq!(result.vote_ratio, Some(0.75));
+
+        assert!(!pending.result(0.8).accepted);
+    }
+
+    #[test]
+    fn process_returns_typed_yin_and_measured_audio_levels() {
+        let mut detector = yin_detector();
+        let outcome = detector.process(&vec![0.0; 128]).unwrap();
+
+        assert_eq!(outcome.rms_dbfs, -120.0);
+        assert_eq!(outcome.peak, 0.0);
+        assert!(!outcome.onset_detected);
+        assert_eq!(outcome.selected_note, None);
+        assert!(outcome.note_decisions.is_empty());
+        assert_eq!(outcome.onset_to_note_latency, None);
+        assert!(outcome.yin.is_some());
+        assert!(outcome.spectral.is_none());
+    }
+
+    #[test]
+    fn note_changes_return_ordered_actions_and_onset_latency() {
+        let mut detector = yin_detector();
+        let onset = Instant::now();
+
+        let (first_actions, first_latency) = detector.send_new_note(48, Some(onset));
+        assert_eq!(first_actions, vec![NoteDecision::NoteOn { note: 48 }]);
+        assert!(first_latency.is_some());
+
+        let (change_actions, change_latency) = detector.send_new_note(49, Some(Instant::now()));
+        assert_eq!(
+            change_actions,
+            vec![
+                NoteDecision::NoteOff { note: 48 },
+                NoteDecision::NoteOn { note: 49 },
+            ]
+        );
+        assert!(change_latency.is_some());
+        assert_eq!(
+            detector.shutdown(),
+            vec![NoteDecision::NoteOff { note: 49 }]
+        );
+    }
+
+    #[test]
+    fn spectral_result_exposes_real_classification_values_and_matches() {
+        let result = SpectralResult::from_classification(Classification {
+            note: 48,
+            score: 0.91,
+            second_score: 0.82,
+            margin: 0.09,
+            accepted: true,
+            ranked_matches: vec![
+                RankedMatch {
+                    note: 48,
+                    score: 0.91,
+                },
+                RankedMatch {
+                    note: 49,
+                    score: 0.82,
+                },
+            ],
+        });
+
+        assert_eq!(result.note, 48);
+        assert_eq!(result.confidence, 0.91);
+        assert_eq!(result.second_score, 0.82);
+        assert_eq!(result.margin, 0.09);
+        assert!(result.accepted);
+        assert_eq!(result.selected_note, Some(48));
+        assert_eq!(result.ranked_matches.len(), 2);
     }
 }

@@ -14,4 +14,5 @@ pub mod onset;
 pub mod templates;
 mod worker;
 
+pub use detector::{DetectorOutcome, NoteDecision, SpectralResult, YinDecision, YinResult};
 pub use worker::{EngineCommand, EngineEvent, EngineState, PssEngine};
