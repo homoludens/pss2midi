@@ -4,6 +4,7 @@
 //! library consumer. It intentionally contains no GPUI types or dependencies.
 
 pub mod audio;
+mod audio_device;
 pub mod calibration;
 pub mod config;
 pub mod detector;
@@ -14,5 +15,6 @@ pub mod onset;
 pub mod templates;
 mod worker;
 
+pub use audio_device::AudioInputDevice;
 pub use detector::{DetectorOutcome, NoteDecision, SpectralResult, YinDecision, YinResult};
 pub use worker::{EngineCommand, EngineEvent, EngineState, PssEngine};

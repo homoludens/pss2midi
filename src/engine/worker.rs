@@ -12,7 +12,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use crate::engine::{
-    audio::{open_capture_for_worker, CaptureFrameReader},
+    audio_device::{
+        choose_initial_device, is_selectable_device, AlsaAudioDeviceProvider, AudioDeviceProvider,
+        AudioDeviceUnavailable, AudioInputDevice, OpenedAudioCapture, PIPEWIRE_DEFAULT_DEVICE_ID,
+    },
     config::{Cli, DetectorMode, RunArgs},
     detector::{Detector, DetectorOutcome, NoteDecision, SpectralResult, YinResult},
     midi::Midi,
@@ -29,6 +32,8 @@ pub enum EngineCommand {
     Stop,
     SetDetectorMode(DetectorMode),
     SetAudioDevice { device: String },
+    EnumerateAudioDevices,
+    RetryAudioDevice,
     BeginCalibration { samples_per_note: usize },
     RetryCalibrationSample,
     CancelCalibration,
@@ -67,6 +72,23 @@ pub enum EngineEvent {
         rms_dbfs: f32,
         peak_dbfs: f32,
     },
+    AudioDevicesEnumerated {
+        devices: Vec<AudioInputDevice>,
+        selected_device: String,
+    },
+    AudioDeviceSelected {
+        device_id: String,
+    },
+    AudioDeviceOpened {
+        device_id: String,
+    },
+    AudioDeviceUnavailable {
+        device_id: String,
+        message: String,
+    },
+    AudioDeviceEnumerationFailed {
+        message: String,
+    },
     Error {
         message: String,
     },
@@ -83,9 +105,18 @@ pub struct PssEngine {
 impl PssEngine {
     /// Start an idle worker without opening audio or MIDI devices.
     pub fn new() -> io::Result<Self> {
+        Self::new_with_audio_device_preference(None)
+    }
+
+    /// Start an idle worker, preferring `saved_device_id` when ALSA reports it.
+    /// If it is unavailable, the established PipeWire default is selected.
+    pub fn new_with_audio_device_preference(saved_device_id: Option<String>) -> io::Result<Self> {
         let args = default_run_args();
-        let settings = WorkerSettings::from_args(&args);
-        Self::spawn_with_runtime(move || ProductionRuntime::new(args), settings)
+        let settings = WorkerSettings::from_args_and_preference(&args, saved_device_id);
+        Self::spawn_with_runtime(
+            move || ProductionRuntime::new(args, Box::<AlsaAudioDeviceProvider>::default()),
+            settings,
+        )
     }
 
     /// Send a typed command to the worker.
@@ -150,27 +181,54 @@ impl Drop for PssEngine {
 struct WorkerSettings {
     mode: DetectorMode,
     device: String,
+    preferred_device: Option<String>,
+    pending_device: Option<String>,
+    device_selection_resolved: bool,
 }
 
 impl WorkerSettings {
+    #[cfg(test)]
     fn from_args(args: &RunArgs) -> Self {
+        Self::from_args_and_preference(args, None)
+    }
+
+    fn from_args_and_preference(args: &RunArgs, preferred_device: Option<String>) -> Self {
         Self {
             mode: args.detector,
             device: args.audio.device.clone(),
+            preferred_device,
+            pending_device: None,
+            device_selection_resolved: false,
         }
+    }
+}
+
+#[derive(Debug)]
+enum RuntimeFailure {
+    AudioDevice(AudioDeviceUnavailable),
+    Other(String),
+}
+
+impl RuntimeFailure {
+    fn audio_device(device_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::AudioDevice(AudioDeviceUnavailable {
+            device_id: device_id.into(),
+            message: message.into(),
+        })
     }
 }
 
 /// Runtime operations are injectable so the worker's lifecycle and command
 /// scheduling can be exercised without ALSA or MIDI hardware.
 trait WorkerRuntime: 'static {
-    fn start(&mut self, settings: &WorkerSettings) -> Result<(), String>;
+    fn enumerate_audio_devices(&mut self) -> Result<Vec<AudioInputDevice>, String>;
+    fn start(&mut self, settings: &WorkerSettings) -> Result<(), RuntimeFailure>;
     fn stop(&mut self, events: &mut Vec<EngineEvent>) -> Result<(), String>;
     fn capture_step(
         &mut self,
         max_wait: Duration,
         events: &mut Vec<EngineEvent>,
-    ) -> Result<(), String>;
+    ) -> Result<(), RuntimeFailure>;
 }
 
 fn run_worker<R>(
@@ -192,7 +250,7 @@ fn run_worker<R>(
                     let mut events = Vec::new();
                     if let Err(error) = runtime.capture_step(CAPTURE_POLL_INTERVAL, &mut events) {
                         publish_events(&event_tx, events);
-                        let _ = event_tx.send(EngineEvent::Error { message: error });
+                        publish_runtime_failure(&event_tx, error);
                         stop_runtime(&mut runtime, &event_tx);
                         running = false;
                         let _ = event_tx.send(EngineEvent::StateChanged(EngineState::Stopped));
@@ -212,6 +270,7 @@ fn run_worker<R>(
 
         match command {
             EngineCommand::Start if !running => {
+                resolve_initial_device(&mut runtime, &event_tx, &mut settings);
                 running = start_runtime(&mut runtime, &settings, &event_tx);
             }
             EngineCommand::Start => {}
@@ -234,17 +293,19 @@ fn run_worker<R>(
             }
             EngineCommand::SetDetectorMode(_) => {}
             EngineCommand::SetAudioDevice { device } if settings.device != device => {
-                let mut next_settings = settings.clone();
-                next_settings.device = device;
-                running = reconfigure_runtime(
-                    &mut runtime,
-                    &event_tx,
-                    &mut settings,
-                    next_settings,
-                    running,
-                );
+                running =
+                    select_audio_device(&mut runtime, &event_tx, &mut settings, running, device);
             }
-            EngineCommand::SetAudioDevice { .. } => {}
+            EngineCommand::SetAudioDevice { device } => {
+                let _ =
+                    select_audio_device(&mut runtime, &event_tx, &mut settings, running, device);
+            }
+            EngineCommand::EnumerateAudioDevices => {
+                enumerate_audio_devices(&mut runtime, &event_tx, &mut settings);
+            }
+            EngineCommand::RetryAudioDevice => {
+                running = retry_audio_device(&mut runtime, &event_tx, &mut settings, running);
+            }
             EngineCommand::Shutdown => break,
             EngineCommand::BeginCalibration { .. }
             | EngineCommand::RetryCalibrationSample
@@ -274,13 +335,175 @@ fn start_runtime<R: WorkerRuntime>(
 ) -> bool {
     match runtime.start(settings) {
         Ok(()) => {
+            let _ = event_tx.send(EngineEvent::AudioDeviceOpened {
+                device_id: settings.device.clone(),
+            });
             let _ = event_tx.send(EngineEvent::StateChanged(EngineState::Running));
             true
         }
-        Err(message) => {
-            let _ = event_tx.send(EngineEvent::Error { message });
+        Err(error) => {
+            publish_runtime_failure(event_tx, error);
             let _ = event_tx.send(EngineEvent::StateChanged(EngineState::Stopped));
             false
+        }
+    }
+}
+
+fn resolve_initial_device<R: WorkerRuntime>(
+    runtime: &mut R,
+    event_tx: &Sender<EngineEvent>,
+    settings: &mut WorkerSettings,
+) {
+    if settings.device_selection_resolved {
+        return;
+    }
+
+    match runtime.enumerate_audio_devices() {
+        Ok(devices) => {
+            settings.device = choose_initial_device(&devices, settings.preferred_device.as_deref());
+            settings.preferred_device = None;
+            settings.device_selection_resolved = true;
+            let _ = event_tx.send(EngineEvent::AudioDevicesEnumerated {
+                devices,
+                selected_device: settings.device.clone(),
+            });
+        }
+        Err(message) => {
+            let _ = event_tx.send(EngineEvent::AudioDeviceEnumerationFailed { message });
+            // Preserve the historical PipeWire default if discovery itself is
+            // temporarily unavailable. Opening it still has to succeed before
+            // the worker reports the device as active.
+            settings.device = PIPEWIRE_DEFAULT_DEVICE_ID.to_owned();
+            settings.preferred_device = None;
+            settings.device_selection_resolved = true;
+        }
+    }
+}
+
+fn enumerate_audio_devices<R: WorkerRuntime>(
+    runtime: &mut R,
+    event_tx: &Sender<EngineEvent>,
+    settings: &mut WorkerSettings,
+) {
+    match runtime.enumerate_audio_devices() {
+        Ok(devices) => {
+            if !settings.device_selection_resolved {
+                settings.device =
+                    choose_initial_device(&devices, settings.preferred_device.as_deref());
+                settings.preferred_device = None;
+                settings.pending_device = None;
+                settings.device_selection_resolved = true;
+            }
+            let _ = event_tx.send(EngineEvent::AudioDevicesEnumerated {
+                devices,
+                selected_device: settings.device.clone(),
+            });
+        }
+        Err(message) => {
+            let _ = event_tx.send(EngineEvent::AudioDeviceEnumerationFailed { message });
+        }
+    }
+}
+
+fn select_audio_device<R: WorkerRuntime>(
+    runtime: &mut R,
+    event_tx: &Sender<EngineEvent>,
+    settings: &mut WorkerSettings,
+    was_running: bool,
+    device_id: String,
+) -> bool {
+    let devices = match runtime.enumerate_audio_devices() {
+        Ok(devices) => devices,
+        Err(message) => {
+            let _ = event_tx.send(EngineEvent::AudioDeviceEnumerationFailed { message });
+            return was_running;
+        }
+    };
+    if !is_selectable_device(&devices, &device_id) {
+        settings.pending_device = Some(device_id.clone());
+        let _ = event_tx.send(EngineEvent::AudioDeviceUnavailable {
+            device_id: device_id.clone(),
+            message: "The selected audio input is not currently available".to_owned(),
+        });
+        return was_running;
+    }
+
+    let mut next_settings = settings.clone();
+    next_settings.device = device_id.clone();
+    next_settings.preferred_device = None;
+    next_settings.pending_device = None;
+    next_settings.device_selection_resolved = true;
+    let _ = event_tx.send(EngineEvent::AudioDeviceSelected { device_id });
+    if next_settings.device == settings.device {
+        return was_running;
+    }
+
+    reconfigure_runtime(runtime, event_tx, settings, next_settings, was_running)
+}
+
+fn retry_audio_device<R: WorkerRuntime>(
+    runtime: &mut R,
+    event_tx: &Sender<EngineEvent>,
+    settings: &mut WorkerSettings,
+    was_running: bool,
+) -> bool {
+    if was_running && settings.pending_device.is_none() {
+        return true;
+    }
+    let target_device = settings
+        .pending_device
+        .clone()
+        .unwrap_or_else(|| settings.device.clone());
+    let devices = match runtime.enumerate_audio_devices() {
+        Ok(devices) => devices,
+        Err(message) => {
+            let _ = event_tx.send(EngineEvent::AudioDeviceEnumerationFailed { message });
+            return was_running;
+        }
+    };
+    if !is_selectable_device(&devices, &target_device) {
+        let _ = event_tx.send(EngineEvent::AudioDeviceUnavailable {
+            device_id: target_device,
+            message: "The selected audio input is not currently available".to_owned(),
+        });
+        return was_running;
+    }
+
+    let mut next_settings = settings.clone();
+    next_settings.device = target_device.clone();
+    next_settings.preferred_device = None;
+    next_settings.pending_device = None;
+    next_settings.device_selection_resolved = true;
+    if next_settings.device != settings.device {
+        let _ = event_tx.send(EngineEvent::AudioDeviceSelected {
+            device_id: target_device,
+        });
+        if was_running {
+            reconfigure_runtime(runtime, event_tx, settings, next_settings, true)
+        } else {
+            *settings = next_settings;
+            start_runtime(runtime, settings, event_tx)
+        }
+    } else {
+        settings.pending_device = None;
+        if was_running {
+            true
+        } else {
+            start_runtime(runtime, settings, event_tx)
+        }
+    }
+}
+
+fn publish_runtime_failure(event_tx: &Sender<EngineEvent>, error: RuntimeFailure) {
+    match error {
+        RuntimeFailure::AudioDevice(error) => {
+            let _ = event_tx.send(EngineEvent::AudioDeviceUnavailable {
+                device_id: error.device_id,
+                message: error.message,
+            });
+        }
+        RuntimeFailure::Other(message) => {
+            let _ = event_tx.send(EngineEvent::Error { message });
         }
     }
 }
@@ -328,14 +551,16 @@ fn publish_events(event_tx: &Sender<EngineEvent>, events: Vec<EngineEvent>) {
 
 struct ProductionRuntime {
     args: RunArgs,
+    audio_device_provider: Box<dyn AudioDeviceProvider>,
     resources: WorkerResources,
     outcome_publisher: OutcomeEventPublisher,
 }
 
 impl ProductionRuntime {
-    fn new(args: RunArgs) -> Self {
+    fn new(args: RunArgs, audio_device_provider: Box<dyn AudioDeviceProvider>) -> Self {
         Self {
             args,
+            audio_device_provider,
             resources: WorkerResources::default(),
             outcome_publisher: OutcomeEventPublisher::default(),
         }
@@ -356,20 +581,27 @@ impl ProductionRuntime {
 }
 
 impl WorkerRuntime for ProductionRuntime {
-    fn start(&mut self, settings: &WorkerSettings) -> Result<(), String> {
+    fn enumerate_audio_devices(&mut self) -> Result<Vec<AudioInputDevice>, String> {
+        self.audio_device_provider.enumerate_capture_devices()
+    }
+
+    fn start(&mut self, settings: &WorkerSettings) -> Result<(), RuntimeFailure> {
         let mut args = self.args.clone();
         args.detector = settings.mode;
         args.audio.device = settings.device.clone();
 
         // Construct into locals so a partial failure drops everything opened
         // for this attempted start and leaves the runtime stopped.
-        let (capture, sample_rate, hop) = open_capture_for_worker(&args.audio)
-            .with_context(|| format!("Cannot start capture from '{}'", args.audio.device))
-            .map_err(|error| format!("{error:#}"))?;
-        let midi = Midi::new().map_err(|error| format!("{error:#}"))?;
+        let capture = self
+            .audio_device_provider
+            .open_capture(&settings.device, &args.audio)
+            .map_err(RuntimeFailure::AudioDevice)?;
+        let sample_rate = capture.sample_rate;
+        let hop = capture.hop;
+        let midi = Midi::new().map_err(|error| RuntimeFailure::Other(format!("{error:#}")))?;
         let detector = Detector::new(&args, sample_rate, hop)
             .context("Cannot create detector")
-            .map_err(|error| format!("{error:#}"))?;
+            .map_err(|error| RuntimeFailure::Other(format!("{error:#}")))?;
 
         self.args = args;
         self.resources = WorkerResources {
@@ -378,6 +610,7 @@ impl WorkerRuntime for ProductionRuntime {
             midi: Some(midi),
             active_note: None,
             frame: vec![0.0; hop],
+            active_device: Some(settings.device.clone()),
         };
         self.outcome_publisher = OutcomeEventPublisher::default();
         Ok(())
@@ -414,6 +647,7 @@ impl WorkerRuntime for ProductionRuntime {
         self.resources.capture.take();
         self.resources.midi.take();
         self.resources.active_note = None;
+        self.resources.active_device = None;
         self.resources.frame.clear();
         self.outcome_publisher = OutcomeEventPublisher::default();
 
@@ -427,15 +661,22 @@ impl WorkerRuntime for ProductionRuntime {
         &mut self,
         max_wait: Duration,
         events: &mut Vec<EngineEvent>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeFailure> {
         let frame_ready = {
             let resources = &mut self.resources;
             let Some(capture) = resources.capture.as_mut() else {
-                return Err("Capture stream is not open".to_owned());
+                return Err(RuntimeFailure::Other(
+                    "Capture stream is not open".to_owned(),
+                ));
             };
             capture
                 .try_next_frame(&mut resources.frame, max_wait)
-                .map_err(|error| format!("{error:#}"))?
+                .map_err(|error| {
+                    RuntimeFailure::audio_device(
+                        resources.active_device.as_deref().unwrap_or("unknown"),
+                        format!("{error:#}"),
+                    )
+                })?
                 .is_some()
         };
         if !frame_ready {
@@ -448,7 +689,7 @@ impl WorkerRuntime for ProductionRuntime {
             .as_mut()
             .context("Detector is not running")
             .and_then(|detector| detector.process(&self.resources.frame))
-            .map_err(|error| format!("{error:#}"))?;
+            .map_err(|error| RuntimeFailure::Other(format!("{error:#}")))?;
 
         let resources = &mut self.resources;
         self.outcome_publisher
@@ -458,17 +699,18 @@ impl WorkerRuntime for ProductionRuntime {
                 &mut resources.active_note,
                 events,
             )
-            .map_err(|error| format!("{error:#}"))
+            .map_err(|error| RuntimeFailure::Other(format!("{error:#}")))
     }
 }
 
 #[derive(Default)]
 struct WorkerResources {
-    capture: Option<CaptureFrameReader>,
+    capture: Option<OpenedAudioCapture>,
     detector: Option<Detector>,
     midi: Option<Midi>,
     active_note: Option<u8>,
     frame: Vec<f32>,
+    active_device: Option<String>,
 }
 
 trait MidiPort {
@@ -617,6 +859,7 @@ fn default_run_args() -> RunArgs {
 mod tests {
     use super::*;
     use std::{
+        collections::HashMap,
         sync::{Arc, Mutex},
         time::Instant,
     };
@@ -630,19 +873,56 @@ mod tests {
 
     struct FakeRuntime {
         actions: Arc<Mutex<Vec<FakeAction>>>,
+        provider_state: Arc<Mutex<FakeProviderState>>,
         capture_entered: Option<Sender<()>>,
         fail_first_start: bool,
         active_note: Option<u8>,
+    }
+
+    #[derive(Default)]
+    struct FakeProviderState {
+        devices: Vec<AudioInputDevice>,
+        fail_starts: HashMap<String, usize>,
     }
 
     impl FakeRuntime {
         fn new(actions: Arc<Mutex<Vec<FakeAction>>>) -> Self {
             Self {
                 actions,
+                provider_state: Arc::new(Mutex::new(FakeProviderState {
+                    devices: vec![
+                        AudioInputDevice {
+                            id: "pipewire".to_owned(),
+                            label: "PipeWire default".to_owned(),
+                        },
+                        AudioInputDevice {
+                            id: "hw:2,0".to_owned(),
+                            label: "Mock capture 2".to_owned(),
+                        },
+                        AudioInputDevice {
+                            id: "hw:9,0".to_owned(),
+                            label: "Mock capture 9".to_owned(),
+                        },
+                    ],
+                    fail_starts: HashMap::new(),
+                })),
                 capture_entered: None,
                 fail_first_start: false,
                 active_note: None,
             }
+        }
+
+        fn with_devices(self, devices: Vec<AudioInputDevice>) -> Self {
+            self.provider_state.lock().unwrap().devices = devices;
+            self
+        }
+
+        fn fail_device_start(&mut self, device_id: &str, attempts: usize) {
+            self.provider_state
+                .lock()
+                .unwrap()
+                .fail_starts
+                .insert(device_id.to_owned(), attempts);
         }
 
         fn with_capture_signal(mut self, capture_entered: Sender<()>) -> Self {
@@ -652,14 +932,28 @@ mod tests {
     }
 
     impl WorkerRuntime for FakeRuntime {
-        fn start(&mut self, settings: &WorkerSettings) -> Result<(), String> {
+        fn enumerate_audio_devices(&mut self) -> Result<Vec<AudioInputDevice>, String> {
+            Ok(self.provider_state.lock().unwrap().devices.clone())
+        }
+
+        fn start(&mut self, settings: &WorkerSettings) -> Result<(), RuntimeFailure> {
             self.actions.lock().unwrap().push(FakeAction::Start {
                 mode: settings.mode,
                 device: settings.device.clone(),
             });
             if self.fail_first_start {
                 self.fail_first_start = false;
-                return Err("fake start failed".to_owned());
+                return Err(RuntimeFailure::Other("fake start failed".to_owned()));
+            }
+            let mut provider_state = self.provider_state.lock().unwrap();
+            if let Some(remaining) = provider_state.fail_starts.get_mut(&settings.device) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Err(RuntimeFailure::audio_device(
+                        &settings.device,
+                        "mock capture open failed",
+                    ));
+                }
             }
             Ok(())
         }
@@ -678,7 +972,7 @@ mod tests {
             &mut self,
             max_wait: Duration,
             events: &mut Vec<EngineEvent>,
-        ) -> Result<(), String> {
+        ) -> Result<(), RuntimeFailure> {
             self.actions
                 .lock()
                 .unwrap()
@@ -716,6 +1010,17 @@ mod tests {
         PssEngine::spawn_with_runtime(move || runtime, WorkerSettings::from_args(&args)).unwrap()
     }
 
+    fn spawn_fake_with_settings(runtime: FakeRuntime, settings: WorkerSettings) -> PssEngine {
+        PssEngine::spawn_with_runtime(move || runtime, settings).unwrap()
+    }
+
+    fn mock_device(id: &str, label: &str) -> AudioInputDevice {
+        AudioInputDevice {
+            id: id.to_owned(),
+            label: label.to_owned(),
+        }
+    }
+
     fn recv_until(
         engine: &PssEngine,
         mut predicate: impl FnMut(&EngineEvent) -> bool,
@@ -729,6 +1034,128 @@ mod tests {
                 return event;
             }
         }
+    }
+
+    #[test]
+    fn enumeration_prefers_a_saved_device_reported_by_the_provider() {
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let runtime = FakeRuntime::new(Arc::clone(&actions)).with_devices(vec![
+            mock_device("hw:1,0", "Built-in capture"),
+            mock_device("hw:2,0", "USB capture"),
+        ]);
+        let args = default_run_args();
+        let settings = WorkerSettings::from_args_and_preference(&args, Some("hw:2,0".to_owned()));
+        let mut engine = spawn_fake_with_settings(runtime, settings);
+
+        engine.send(EngineCommand::EnumerateAudioDevices).unwrap();
+        assert_eq!(
+            recv_until(&engine, |event| matches!(
+                event,
+                EngineEvent::AudioDevicesEnumerated { .. }
+            )),
+            EngineEvent::AudioDevicesEnumerated {
+                devices: vec![
+                    mock_device("hw:1,0", "Built-in capture"),
+                    mock_device("hw:2,0", "USB capture"),
+                ],
+                selected_device: "hw:2,0".to_owned(),
+            }
+        );
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn unavailable_saved_device_falls_back_to_pipewire_without_fabricating_entry() {
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let enumerated = vec![mock_device("hw:1,0", "Built-in capture")];
+        let runtime = FakeRuntime::new(Arc::clone(&actions)).with_devices(enumerated.clone());
+        let args = default_run_args();
+        let settings =
+            WorkerSettings::from_args_and_preference(&args, Some("hw:missing,0".to_owned()));
+        let mut engine = spawn_fake_with_settings(runtime, settings);
+
+        engine.send(EngineCommand::EnumerateAudioDevices).unwrap();
+        assert_eq!(
+            recv_until(&engine, |event| matches!(
+                event,
+                EngineEvent::AudioDevicesEnumerated { .. }
+            )),
+            EngineEvent::AudioDevicesEnumerated {
+                devices: enumerated,
+                selected_device: "pipewire".to_owned(),
+            }
+        );
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn unavailable_selection_reports_error_and_failed_open_can_be_retried() {
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = FakeRuntime::new(Arc::clone(&actions))
+            .with_devices(vec![mock_device("hw:1,0", "Built-in capture")]);
+        runtime.fail_device_start("hw:gone,0", 1);
+        let provider_state = Arc::clone(&runtime.provider_state);
+        let mut engine = spawn_fake(runtime);
+
+        engine
+            .send(EngineCommand::SetAudioDevice {
+                device: "hw:gone,0".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_until(&engine, |event| matches!(
+                event,
+                EngineEvent::AudioDeviceUnavailable { .. }
+            )),
+            EngineEvent::AudioDeviceUnavailable { device_id, .. } if device_id == "hw:gone,0"
+        ));
+
+        provider_state
+            .lock()
+            .unwrap()
+            .devices
+            .push(mock_device("hw:gone,0", "Reconnected capture"));
+        engine.send(EngineCommand::RetryAudioDevice).unwrap();
+        assert_eq!(
+            recv_until(&engine, |event| matches!(
+                event,
+                EngineEvent::AudioDeviceSelected { .. }
+            )),
+            EngineEvent::AudioDeviceSelected {
+                device_id: "hw:gone,0".to_owned(),
+            }
+        );
+        assert!(matches!(
+            recv_until(&engine, |event| matches!(
+                event,
+                EngineEvent::AudioDeviceUnavailable { .. }
+            )),
+            EngineEvent::AudioDeviceUnavailable { device_id, message }
+                if device_id == "hw:gone,0" && message == "mock capture open failed"
+        ));
+        assert_eq!(
+            recv_until(&engine, |event| *event
+                == EngineEvent::StateChanged(EngineState::Stopped)),
+            EngineEvent::StateChanged(EngineState::Stopped)
+        );
+        assert!(matches!(engine.try_recv_event(), Err(TryRecvError::Empty)));
+
+        engine.send(EngineCommand::RetryAudioDevice).unwrap();
+        assert_eq!(
+            recv_until(&engine, |event| matches!(
+                event,
+                EngineEvent::AudioDeviceOpened { .. }
+            )),
+            EngineEvent::AudioDeviceOpened {
+                device_id: "hw:gone,0".to_owned(),
+            }
+        );
+        assert_eq!(
+            recv_until(&engine, |event| *event
+                == EngineEvent::StateChanged(EngineState::Running)),
+            EngineEvent::StateChanged(EngineState::Running)
+        );
+        engine.shutdown().unwrap();
     }
 
     #[test]

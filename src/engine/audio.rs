@@ -55,6 +55,10 @@ pub(crate) struct CaptureFrameReader {
     sample_index: u64,
 }
 
+pub(crate) trait AudioFrameSource: Send {
+    fn try_next_frame(&mut self, frame: &mut [f32], timeout: Duration) -> Result<Option<u64>>;
+}
+
 impl CaptureFrameReader {
     fn new(pcm: PCM, hop: usize) -> Result<Self> {
         anyhow::ensure!(hop > 0, "audio hop cannot be empty");
@@ -129,6 +133,12 @@ impl CaptureFrameReader {
                 }
             }
         }
+    }
+}
+
+impl AudioFrameSource for CaptureFrameReader {
+    fn try_next_frame(&mut self, frame: &mut [f32], timeout: Duration) -> Result<Option<u64>> {
+        CaptureFrameReader::try_next_frame(self, frame, timeout)
     }
 }
 
