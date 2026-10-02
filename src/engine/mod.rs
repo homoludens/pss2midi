@@ -12,3 +12,6 @@ pub mod midi;
 pub mod note;
 pub mod onset;
 pub mod templates;
+mod worker;
+
+pub use worker::{EngineCommand, EngineEvent, EngineState, PssEngine};
