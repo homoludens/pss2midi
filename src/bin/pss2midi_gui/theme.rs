@@ -11,6 +11,14 @@ pub(super) const TEXT_SECONDARY: u32 = 0xa4b2c1;
 pub(super) const TEXT_MUTED: u32 = 0x718293;
 pub(super) const ACCENT: u32 = 0x37a8f5;
 pub(super) const ACCENT_TINT: u32 = 0x17334a;
+pub(super) const SUCCESS: u32 = 0x4fcb8d;
+pub(super) const SUCCESS_TINT: u32 = 0x17382d;
+pub(super) const WARNING: u32 = 0xf1b64a;
+pub(super) const WARNING_TINT: u32 = 0x3d3017;
+pub(super) const ERROR: u32 = 0xf07575;
+pub(super) const ERROR_TINT: u32 = 0x3b2023;
+pub(super) const PIANO_WHITE_KEY: u32 = 0xdce5ec;
+pub(super) const PIANO_BLACK_KEY: u32 = 0x263441;
 
 pub(super) const SPACE_XS: f32 = 4.0;
 pub(super) const SPACE_SM: f32 = 8.0;
