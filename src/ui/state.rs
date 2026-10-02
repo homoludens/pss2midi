@@ -114,8 +114,12 @@ pub struct CalibrationCompletion {
 pub struct CalibrationState {
     pub status: CalibrationStatus,
     pub progress: Option<CalibrationProgress>,
+    /// Most recent captured sample outcome, retained when the engine follows
+    /// it with an `AwaitingOnset` progress update for the next attempt.
+    pub last_sample_result: Option<CalibrationProgress>,
     pub completed_notes: BTreeSet<u8>,
     pub completion: Option<CalibrationCompletion>,
+    pub error_message: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -526,10 +530,16 @@ impl AppState {
             EngineEvent::CalibrationProgress(progress) => {
                 if self.calibration.status != CalibrationStatus::Running {
                     self.calibration.completed_notes.clear();
+                    self.calibration.last_sample_result = None;
+                }
+                if !matches!(&progress.quality, CalibrationSampleQuality::AwaitingOnset) {
+                    self.calibration.last_sample_result = Some(progress.clone());
                 }
                 self.calibration.status = CalibrationStatus::Running;
                 self.calibration.progress = Some(progress.clone());
                 self.calibration.completion = None;
+                self.calibration.error_message = None;
+                self.clear_error_of_kind(ErrorKind::Calibration);
                 self.push_event(
                     RecentEventKind::CalibrationProgress {
                         requested_note: progress.requested_note,
@@ -559,6 +569,7 @@ impl AppState {
                     sample_count,
                     template_path: template_path.clone(),
                 });
+                self.calibration.error_message = None;
                 self.clear_error_of_kind(ErrorKind::Calibration);
                 self.push_event(
                     RecentEventKind::CalibrationCompleted {
@@ -572,10 +583,14 @@ impl AppState {
             EngineEvent::CalibrationCancelled => {
                 self.calibration.status = CalibrationStatus::Cancelled;
                 self.calibration.completion = None;
+                self.calibration.error_message = None;
+                self.clear_error_of_kind(ErrorKind::Calibration);
                 self.push_event(RecentEventKind::CalibrationCancelled, wall_clock_at);
             }
             EngineEvent::CalibrationError { message } => {
                 self.calibration.status = CalibrationStatus::Error;
+                self.calibration.completion = None;
+                self.calibration.error_message = Some(message.clone());
                 self.set_error(ErrorKind::Calibration, message.clone());
                 self.push_event(RecentEventKind::CalibrationError { message }, wall_clock_at);
             }

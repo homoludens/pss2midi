@@ -1,4 +1,6 @@
 // These reusable widgets are introduced before their page integration tasks.
+#[path = "pss2midi_gui/calibration.rs"]
+mod calibration;
 #[allow(dead_code)]
 #[path = "pss2midi_gui/components.rs"]
 mod components;
