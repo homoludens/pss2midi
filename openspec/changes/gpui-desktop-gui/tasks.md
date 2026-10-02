@@ -28,5 +28,5 @@
 
 ## 4. Verification
 
-- [ ] 4.1 Add or complete tests for note-name/key mapping, event reduction, detector modes, settings serialization, and calibration progress; verify `cargo fmt --check` and `cargo test` pass.
+- [x] 4.1 Add or complete tests for note-name/key mapping, event reduction, detector modes, settings serialization, and calibration progress; verify `cargo fmt --check` and `cargo test` pass.
 - [ ] 4.2 Build the release binary and validate on the target Gentoo/Linux setup that audio input selection, YIN/Spectral/Compare modes, MIDI output to Neothesia, calibration save/load, error display, and clean shutdown work end to end.

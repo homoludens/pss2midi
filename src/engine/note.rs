@@ -52,6 +52,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn note_names_follow_midi_pitch_class_and_octave() {
+        let notes = [
+            (36, "C2"),
+            (37, "C#2"),
+            (38, "D2"),
+            (39, "D#2"),
+            (40, "E2"),
+            (41, "F2"),
+            (42, "F#2"),
+            (43, "G2"),
+            (44, "G#2"),
+            (45, "A2"),
+            (46, "A#2"),
+            (47, "B2"),
+            (48, "C3"),
+            (49, "C#3"),
+            (60, "C4"),
+            (72, "C5"),
+        ];
+
+        for (midi_note, expected) in notes {
+            assert_eq!(note_name(midi_note), expected, "MIDI note {midi_note}");
+        }
+    }
+
+    #[test]
     fn quantizer_keeps_pss_f30_range_c2_through_c5() {
         assert_eq!(quantize_pitch(36.0).map(|(note, _)| note), Some(36));
         assert_eq!(quantize_pitch(72.0).map(|(note, _)| note), Some(72));
