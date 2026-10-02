@@ -1,3 +1,5 @@
+//! Spectral feature extraction and indexed audio-window helpers.
+
 use anyhow::{ensure, Result};
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
 use std::{collections::VecDeque, sync::Arc};

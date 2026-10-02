@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use midir::{os::unix::VirtualOutput, MidiOutput, MidiOutputConnection};
 
-use crate::note::note_name;
+use crate::engine::note::note_name;
 
 pub struct Midi {
     conn: MidiOutputConnection,

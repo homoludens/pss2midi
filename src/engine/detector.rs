@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::{ensure, Result};
 use aubio::{Pitch, PitchMode, PitchUnit};
 
-use crate::{
+use crate::engine::{
     config::{default_template_path, DetectorMode, RunArgs},
     features::{FeatureExtractor, SampleCapture, SampleHistory},
     midi::Midi,

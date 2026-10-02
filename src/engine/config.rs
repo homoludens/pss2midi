@@ -1,3 +1,5 @@
+//! Command-line and runtime configuration shared by the CLI and engine.
+
 use std::path::PathBuf;
 
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};

@@ -1,3 +1,5 @@
+//! Supported MIDI note mapping and audio-level helpers.
+
 pub const MIN_MIDI: i32 = 36; // C2
 pub const MAX_MIDI: i32 = 72; // C5
 pub const NOTE_COUNT: usize = (MAX_MIDI - MIN_MIDI + 1) as usize;

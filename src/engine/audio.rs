@@ -4,7 +4,7 @@ use alsa::{
 };
 use anyhow::{Context, Result};
 
-use crate::config::AudioArgs;
+use crate::engine::config::AudioArgs;
 
 pub fn open_capture(args: &AudioArgs) -> Result<(PCM, u32, usize)> {
     let pcm = PCM::new(&args.device, Direction::Capture, false)

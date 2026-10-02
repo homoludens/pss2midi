@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use anyhow::{ensure, Context, Result};
 
-use crate::{
+use crate::engine::{
     audio::{open_capture, AudioFrameReader},
     config::{default_template_path, CalibrateArgs},
     features::{FeatureExtractor, SampleCapture},

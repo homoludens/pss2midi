@@ -1,13 +1,3 @@
-mod audio;
-mod calibration;
-mod config;
-mod detector;
-mod features;
-mod midi;
-mod note;
-mod onset;
-mod templates;
-
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -16,8 +6,9 @@ use std::sync::{
 use anyhow::Result;
 use clap::Parser;
 
-use crate::{
+use pss2midi::engine::{
     audio::open_capture,
+    calibration,
     config::{Cli, Commands, DetectorMode, RunArgs},
     detector::Detector,
     midi::Midi,

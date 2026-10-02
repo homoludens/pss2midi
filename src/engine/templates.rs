@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fs, path::Path};
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{
+use crate::engine::{
     features::FeatureExtractor,
     note::{MAX_MIDI, MIN_MIDI},
 };
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn calibration_and_runtime_extractor_metadata_must_match() {
-        use crate::features::FeatureExtractor;
+        use crate::engine::features::FeatureExtractor;
 
         let extractor = FeatureExtractor::new(48_000, 30.0, 2048).unwrap();
         let mut templates = TemplateFile::empty(48_000, 2048, 30.0, 8.0);
@@ -294,7 +294,7 @@ mod tests {
 
     #[test]
     fn harmonic_template_keeps_note_when_second_harmonic_is_strongest() {
-        use crate::features::FeatureExtractor;
+        use crate::engine::features::FeatureExtractor;
 
         fn keyboard_tone(extractor: &FeatureExtractor, fundamental: f32, phase: f32) -> Vec<f32> {
             (0..extractor.window_samples())

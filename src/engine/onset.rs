@@ -1,7 +1,7 @@
 use anyhow::Result;
 use aubio::{Onset, OnsetMode};
 
-use crate::config::AudioArgs;
+use crate::engine::config::AudioArgs;
 
 pub struct OnsetDetector {
     onset: Onset,
