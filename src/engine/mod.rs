@@ -13,6 +13,7 @@ pub mod features;
 pub mod midi;
 pub mod note;
 pub mod onset;
+mod persistence;
 pub mod templates;
 mod worker;
 

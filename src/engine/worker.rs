@@ -16,9 +16,15 @@ use crate::engine::{
         choose_initial_device, is_selectable_device, AlsaAudioDeviceProvider, AudioDeviceProvider,
         AudioDeviceUnavailable, AudioInputDevice, OpenedAudioCapture, PIPEWIRE_DEFAULT_DEVICE_ID,
     },
-    config::{Cli, DetectorMode, RunArgs},
+    calibration::{
+        CalibrationNoteCompletion, CalibrationProgress, CalibrationResult, CalibrationSession,
+        CalibrationUpdate, DEFAULT_SAMPLES_PER_NOTE,
+    },
+    config::{default_template_path, Cli, DetectorMode, RunArgs},
     detector::{Detector, DetectorOutcome, NoteDecision, SpectralResult, YinResult},
     midi::Midi,
+    note::rms_db,
+    persistence::TemplatePersistenceTask,
 };
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -37,6 +43,7 @@ pub enum EngineCommand {
     BeginCalibration { samples_per_note: usize },
     RetryCalibrationSample,
     CancelCalibration,
+    SetTemplatePath { path: PathBuf },
     ReloadTemplates { path: Option<PathBuf> },
     Shutdown,
 }
@@ -89,6 +96,17 @@ pub enum EngineEvent {
     AudioDeviceEnumerationFailed {
         message: String,
     },
+    CalibrationProgress(CalibrationProgress),
+    CalibrationNoteCompleted(CalibrationNoteCompletion),
+    CalibrationCompleted {
+        note_count: usize,
+        sample_count: usize,
+        template_path: PathBuf,
+    },
+    CalibrationCancelled,
+    CalibrationError {
+        message: String,
+    },
     Error {
         message: String,
     },
@@ -122,6 +140,23 @@ impl PssEngine {
     /// Send a typed command to the worker.
     pub fn send(&self, command: EngineCommand) -> Result<(), SendError<EngineCommand>> {
         self.command_tx.send(command)
+    }
+
+    /// Begin calibration with the default five accepted samples per note.
+    pub fn begin_calibration(&self) -> Result<(), SendError<EngineCommand>> {
+        self.begin_calibration_with_samples(DEFAULT_SAMPLES_PER_NOTE)
+    }
+
+    pub fn begin_calibration_with_samples(
+        &self,
+        samples_per_note: usize,
+    ) -> Result<(), SendError<EngineCommand>> {
+        self.send(EngineCommand::BeginCalibration { samples_per_note })
+    }
+
+    /// Select the template destination used by subsequent calibration runs.
+    pub fn set_template_path(&self, path: PathBuf) -> Result<(), SendError<EngineCommand>> {
+        self.send(EngineCommand::SetTemplatePath { path })
     }
 
     /// Wait for the next high-level worker event.
@@ -181,6 +216,7 @@ impl Drop for PssEngine {
 struct WorkerSettings {
     mode: DetectorMode,
     device: String,
+    template_path: PathBuf,
     preferred_device: Option<String>,
     pending_device: Option<String>,
     device_selection_resolved: bool,
@@ -196,6 +232,7 @@ impl WorkerSettings {
         Self {
             mode: args.detector,
             device: args.audio.device.clone(),
+            template_path: default_template_path(),
             preferred_device,
             pending_device: None,
             device_selection_resolved: false,
@@ -206,6 +243,7 @@ impl WorkerSettings {
 #[derive(Debug)]
 enum RuntimeFailure {
     AudioDevice(AudioDeviceUnavailable),
+    Calibration(String),
     Other(String),
 }
 
@@ -224,11 +262,38 @@ trait WorkerRuntime: 'static {
     fn enumerate_audio_devices(&mut self) -> Result<Vec<AudioInputDevice>, String>;
     fn start(&mut self, settings: &WorkerSettings) -> Result<(), RuntimeFailure>;
     fn stop(&mut self, events: &mut Vec<EngineEvent>) -> Result<(), String>;
+    fn begin_calibration(
+        &mut self,
+        _settings: &WorkerSettings,
+        _samples_per_note: usize,
+        _events: &mut Vec<EngineEvent>,
+    ) -> Result<(), RuntimeFailure> {
+        Err(RuntimeFailure::Other(
+            "Calibration is not supported by this runtime".to_owned(),
+        ))
+    }
+    fn retry_calibration_sample(&mut self, _events: &mut Vec<EngineEvent>) -> Result<(), String> {
+        Err("No calibration session is active".to_owned())
+    }
+    /// Cancel an active session and return whether asynchronous save work still
+    /// needs polling by the worker.
+    fn cancel_calibration(&mut self, _events: &mut Vec<EngineEvent>) -> bool {
+        false
+    }
+    fn abort_calibration(&mut self) {}
+    fn calibration_active(&self) -> bool {
+        false
+    }
     fn capture_step(
         &mut self,
         max_wait: Duration,
         events: &mut Vec<EngineEvent>,
-    ) -> Result<(), RuntimeFailure>;
+    ) -> Result<CaptureStepStatus, RuntimeFailure>;
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CaptureStepStatus {
+    calibration_active: bool,
 }
 
 fn run_worker<R>(
@@ -241,21 +306,40 @@ fn run_worker<R>(
 {
     let _ = event_tx.send(EngineEvent::WorkerStarted);
     let mut running = false;
+    let mut calibrating = false;
 
     loop {
-        let command = if running {
+        let command = if running || calibrating {
             match command_rx.recv_timeout(COMMAND_POLL_INTERVAL) {
                 Ok(command) => command,
                 Err(RecvTimeoutError::Timeout) => {
                     let mut events = Vec::new();
-                    if let Err(error) = runtime.capture_step(CAPTURE_POLL_INTERVAL, &mut events) {
-                        publish_events(&event_tx, events);
-                        publish_runtime_failure(&event_tx, error);
-                        stop_runtime(&mut runtime, &event_tx);
-                        running = false;
-                        let _ = event_tx.send(EngineEvent::StateChanged(EngineState::Stopped));
-                    } else {
-                        publish_events(&event_tx, events);
+                    match runtime.capture_step(CAPTURE_POLL_INTERVAL, &mut events) {
+                        Ok(status) => {
+                            // The status is also reported while normal capture
+                            // is running so asynchronous template persistence
+                            // can finish without blocking audio commands.
+                            calibrating = status.calibration_active;
+                            publish_events(&event_tx, events);
+                        }
+                        Err(error) => {
+                            publish_events(&event_tx, events);
+                            match error {
+                                RuntimeFailure::Calibration(message) => {
+                                    let _ =
+                                        event_tx.send(EngineEvent::CalibrationError { message });
+                                    runtime.abort_calibration();
+                                    calibrating = runtime.calibration_active();
+                                }
+                                error => publish_runtime_failure(&event_tx, error),
+                            }
+                            if running {
+                                stop_runtime(&mut runtime, &event_tx);
+                                running = false;
+                                let _ =
+                                    event_tx.send(EngineEvent::StateChanged(EngineState::Stopped));
+                            }
+                        }
                     }
                     continue;
                 }
@@ -270,6 +354,12 @@ fn run_worker<R>(
 
         match command {
             EngineCommand::Start if !running => {
+                if calibrating {
+                    let mut events = Vec::new();
+                    runtime.cancel_calibration(&mut events);
+                    calibrating = runtime.calibration_active();
+                    publish_events(&event_tx, events);
+                }
                 resolve_initial_device(&mut runtime, &event_tx, &mut settings);
                 running = start_runtime(&mut runtime, &settings, &event_tx);
             }
@@ -277,10 +367,23 @@ fn run_worker<R>(
             EngineCommand::Stop if running => {
                 stop_runtime(&mut runtime, &event_tx);
                 running = false;
+                calibrating = runtime.calibration_active();
                 let _ = event_tx.send(EngineEvent::StateChanged(EngineState::Stopped));
+            }
+            EngineCommand::Stop if calibrating => {
+                let mut events = Vec::new();
+                runtime.cancel_calibration(&mut events);
+                calibrating = runtime.calibration_active();
+                publish_events(&event_tx, events);
             }
             EngineCommand::Stop => {}
             EngineCommand::SetDetectorMode(mode) if settings.mode != mode => {
+                if calibrating {
+                    let mut events = Vec::new();
+                    runtime.cancel_calibration(&mut events);
+                    calibrating = runtime.calibration_active();
+                    publish_events(&event_tx, events);
+                }
                 let mut next_settings = settings.clone();
                 next_settings.mode = mode;
                 running = reconfigure_runtime(
@@ -293,6 +396,12 @@ fn run_worker<R>(
             }
             EngineCommand::SetDetectorMode(_) => {}
             EngineCommand::SetAudioDevice { device } if settings.device != device => {
+                if calibrating {
+                    let mut events = Vec::new();
+                    runtime.cancel_calibration(&mut events);
+                    calibrating = runtime.calibration_active();
+                    publish_events(&event_tx, events);
+                }
                 running =
                     select_audio_device(&mut runtime, &event_tx, &mut settings, running, device);
             }
@@ -306,16 +415,67 @@ fn run_worker<R>(
             EngineCommand::RetryAudioDevice => {
                 running = retry_audio_device(&mut runtime, &event_tx, &mut settings, running);
             }
-            EngineCommand::Shutdown => break,
-            EngineCommand::BeginCalibration { .. }
-            | EngineCommand::RetryCalibrationSample
-            | EngineCommand::CancelCalibration
-            | EngineCommand::ReloadTemplates { .. } => {
-                let _ = event_tx.send(EngineEvent::Error {
-                    message: "Calibration and template reload commands are not available yet"
-                        .to_owned(),
+            EngineCommand::SetTemplatePath { path } => settings.template_path = path,
+            EngineCommand::BeginCalibration { samples_per_note } => {
+                if running {
+                    stop_runtime(&mut runtime, &event_tx);
+                    running = false;
+                    let _ = event_tx.send(EngineEvent::StateChanged(EngineState::Stopped));
+                }
+                if calibrating {
+                    let mut events = Vec::new();
+                    runtime.cancel_calibration(&mut events);
+                    calibrating = runtime.calibration_active();
+                    publish_events(&event_tx, events);
+                }
+                if samples_per_note == 0 {
+                    let _ = event_tx.send(EngineEvent::CalibrationError {
+                        message: "samples per note must be greater than zero".to_owned(),
+                    });
+                    continue;
+                }
+                resolve_initial_device(&mut runtime, &event_tx, &mut settings);
+                let mut events = Vec::new();
+                match runtime.begin_calibration(&settings, samples_per_note, &mut events) {
+                    Ok(()) => {
+                        calibrating = runtime.calibration_active();
+                        publish_events(&event_tx, events);
+                    }
+                    Err(error) => {
+                        publish_events(&event_tx, events);
+                        let message = runtime_failure_message(&error);
+                        let _ = event_tx.send(EngineEvent::CalibrationError { message });
+                        publish_runtime_failure(&event_tx, error);
+                    }
+                }
+            }
+            EngineCommand::RetryCalibrationSample if calibrating => {
+                let mut events = Vec::new();
+                match runtime.retry_calibration_sample(&mut events) {
+                    Ok(()) => publish_events(&event_tx, events),
+                    Err(message) => {
+                        let _ = event_tx.send(EngineEvent::CalibrationError { message });
+                    }
+                }
+            }
+            EngineCommand::RetryCalibrationSample => {
+                let _ = event_tx.send(EngineEvent::CalibrationError {
+                    message: "No calibration session is active".to_owned(),
                 });
             }
+            EngineCommand::CancelCalibration if calibrating => {
+                let mut events = Vec::new();
+                runtime.cancel_calibration(&mut events);
+                calibrating = runtime.calibration_active();
+                publish_events(&event_tx, events);
+            }
+            EngineCommand::CancelCalibration => {}
+            EngineCommand::ReloadTemplates { .. } => {
+                let _ = event_tx.send(EngineEvent::Error {
+                    message: "Template reload is not available yet".to_owned(),
+                });
+            }
+            EngineCommand::Shutdown => break,
         }
     }
 
@@ -323,6 +483,11 @@ fn run_worker<R>(
     if running {
         stop_runtime(&mut runtime, &event_tx);
         let _ = event_tx.send(EngineEvent::StateChanged(EngineState::Stopped));
+    }
+    if calibrating {
+        let mut events = Vec::new();
+        runtime.cancel_calibration(&mut events);
+        publish_events(&event_tx, events);
     }
     drop(runtime);
     let _ = event_tx.send(EngineEvent::WorkerStopped);
@@ -505,6 +670,18 @@ fn publish_runtime_failure(event_tx: &Sender<EngineEvent>, error: RuntimeFailure
         RuntimeFailure::Other(message) => {
             let _ = event_tx.send(EngineEvent::Error { message });
         }
+        RuntimeFailure::Calibration(message) => {
+            let _ = event_tx.send(EngineEvent::CalibrationError { message });
+        }
+    }
+}
+
+fn runtime_failure_message(error: &RuntimeFailure) -> String {
+    match error {
+        RuntimeFailure::AudioDevice(error) => {
+            format!("{}: {}", error.device_id, error.message)
+        }
+        RuntimeFailure::Calibration(message) | RuntimeFailure::Other(message) => message.clone(),
     }
 }
 
@@ -554,6 +731,16 @@ struct ProductionRuntime {
     audio_device_provider: Box<dyn AudioDeviceProvider>,
     resources: WorkerResources,
     outcome_publisher: OutcomeEventPublisher,
+    calibration: Option<CalibrationSession>,
+    pending_template_saves: Vec<PendingTemplateSave>,
+    current_template_path: PathBuf,
+}
+
+struct PendingTemplateSave {
+    task: TemplatePersistenceTask,
+    note_count: usize,
+    sample_count: usize,
+    cancelled: bool,
 }
 
 impl ProductionRuntime {
@@ -563,7 +750,110 @@ impl ProductionRuntime {
             audio_device_provider,
             resources: WorkerResources::default(),
             outcome_publisher: OutcomeEventPublisher::default(),
+            calibration: None,
+            pending_template_saves: Vec::new(),
+            current_template_path: default_template_path(),
         }
+    }
+
+    fn clear_calibration_capture(&mut self) {
+        self.calibration.take();
+        self.resources.capture.take();
+        self.resources.active_device = None;
+        self.resources.frame.clear();
+    }
+
+    fn poll_template_saves(&mut self, events: &mut Vec<EngineEvent>) {
+        let mut index = 0;
+        while index < self.pending_template_saves.len() {
+            let result = self.pending_template_saves[index].task.try_result();
+            let Some(result) = result else {
+                index += 1;
+                continue;
+            };
+
+            let pending = self.pending_template_saves.remove(index);
+            if pending.cancelled {
+                continue;
+            }
+            match result {
+                Ok(template_path) => events.push(EngineEvent::CalibrationCompleted {
+                    note_count: pending.note_count,
+                    sample_count: pending.sample_count,
+                    template_path,
+                }),
+                Err(message) => events.push(EngineEvent::CalibrationError { message }),
+            }
+        }
+    }
+
+    fn capture_calibration_step(
+        &mut self,
+        max_wait: Duration,
+        events: &mut Vec<EngineEvent>,
+    ) -> Result<(), RuntimeFailure> {
+        let frame_start = {
+            let resources = &mut self.resources;
+            let Some(capture) = resources.capture.as_mut() else {
+                return Err(RuntimeFailure::Calibration(
+                    "Calibration capture stream is not open".to_owned(),
+                ));
+            };
+            match capture.try_next_frame(&mut resources.frame, max_wait) {
+                Ok(frame_start) => frame_start,
+                Err(error) => {
+                    let device_id = resources
+                        .active_device
+                        .as_deref()
+                        .unwrap_or("unknown")
+                        .to_owned();
+                    events.push(EngineEvent::AudioDeviceUnavailable {
+                        device_id,
+                        message: format!("{error:#}"),
+                    });
+                    return Err(RuntimeFailure::Calibration(format!(
+                        "Audio capture failed during calibration: {error:#}"
+                    )));
+                }
+            }
+        };
+        let Some(frame_start) = frame_start else {
+            return Ok(());
+        };
+
+        self.outcome_publisher
+            .publish_calibration_frame(&self.resources.frame, events);
+        let updates = self
+            .calibration
+            .as_mut()
+            .context("Calibration session is not active")
+            .and_then(|session| session.process_frame(frame_start, &self.resources.frame))
+            .map_err(|error| RuntimeFailure::Calibration(format!("{error:#}")))?;
+
+        for update in updates {
+            if let Some(result) = append_calibration_update(update, events) {
+                let note_count = result.note_count;
+                let sample_count = result.sample_count;
+                let template_path = self.current_template_path.clone();
+                self.clear_calibration_capture();
+                match TemplatePersistenceTask::spawn(result, template_path.clone()) {
+                    Ok(task) => self.pending_template_saves.push(PendingTemplateSave {
+                        task,
+                        note_count,
+                        sample_count,
+                        cancelled: false,
+                    }),
+                    Err(error) => events.push(EngineEvent::CalibrationError {
+                        message: format!("Could not start template persistence task: {error}"),
+                    }),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn calibration_active(&self) -> bool {
+        self.calibration.is_some() || !self.pending_template_saves.is_empty()
     }
 
     fn apply_decisions(
@@ -616,6 +906,82 @@ impl WorkerRuntime for ProductionRuntime {
         Ok(())
     }
 
+    fn begin_calibration(
+        &mut self,
+        settings: &WorkerSettings,
+        samples_per_note: usize,
+        events: &mut Vec<EngineEvent>,
+    ) -> Result<(), RuntimeFailure> {
+        let mut audio = self.args.audio.clone();
+        audio.device = settings.device.clone();
+        let capture = self
+            .audio_device_provider
+            .open_capture(&settings.device, &audio)
+            .map_err(RuntimeFailure::AudioDevice)?;
+        let sample_rate = capture.sample_rate;
+        let hop = capture.hop;
+        let session = CalibrationSession::new(
+            &audio,
+            sample_rate,
+            hop,
+            &self.args.spectral,
+            samples_per_note,
+        )
+        .map_err(|error| RuntimeFailure::Calibration(format!("{error:#}")))?;
+
+        self.resources = WorkerResources {
+            capture: Some(capture),
+            detector: None,
+            midi: None,
+            active_note: None,
+            frame: vec![0.0; hop],
+            active_device: Some(settings.device.clone()),
+        };
+        self.current_template_path = settings.template_path.clone();
+        self.calibration = Some(session);
+        self.outcome_publisher = OutcomeEventPublisher::default();
+        events.push(EngineEvent::CalibrationProgress(
+            self.calibration
+                .as_ref()
+                .expect("session was just installed")
+                .initial_progress(),
+        ));
+        Ok(())
+    }
+
+    fn retry_calibration_sample(&mut self, events: &mut Vec<EngineEvent>) -> Result<(), String> {
+        let session = self
+            .calibration
+            .as_mut()
+            .ok_or_else(|| "No calibration sample is awaiting capture".to_owned())?;
+        events.push(EngineEvent::CalibrationProgress(
+            session.retry_current_sample(),
+        ));
+        Ok(())
+    }
+
+    fn cancel_calibration(&mut self, events: &mut Vec<EngineEvent>) -> bool {
+        let had_work = self.calibration_active();
+        if self.calibration.is_some() {
+            self.clear_calibration_capture();
+        }
+        for pending in &mut self.pending_template_saves {
+            pending.cancelled = true;
+        }
+        if had_work {
+            events.push(EngineEvent::CalibrationCancelled);
+        }
+        self.calibration_active()
+    }
+
+    fn abort_calibration(&mut self) {
+        self.clear_calibration_capture();
+    }
+
+    fn calibration_active(&self) -> bool {
+        ProductionRuntime::calibration_active(self)
+    }
+
     fn stop(&mut self, events: &mut Vec<EngineEvent>) -> Result<(), String> {
         let decisions = self
             .resources
@@ -650,6 +1016,7 @@ impl WorkerRuntime for ProductionRuntime {
         self.resources.active_device = None;
         self.resources.frame.clear();
         self.outcome_publisher = OutcomeEventPublisher::default();
+        self.calibration.take();
 
         match first_error {
             Some(message) => Err(message),
@@ -661,7 +1028,22 @@ impl WorkerRuntime for ProductionRuntime {
         &mut self,
         max_wait: Duration,
         events: &mut Vec<EngineEvent>,
-    ) -> Result<(), RuntimeFailure> {
+    ) -> Result<CaptureStepStatus, RuntimeFailure> {
+        self.poll_template_saves(events);
+        if self.calibration.is_some() {
+            self.capture_calibration_step(max_wait, events)?;
+            self.poll_template_saves(events);
+            return Ok(CaptureStepStatus {
+                calibration_active: self.calibration_active(),
+            });
+        }
+
+        if self.resources.detector.is_none() {
+            return Ok(CaptureStepStatus {
+                calibration_active: self.calibration_active(),
+            });
+        }
+
         let frame_ready = {
             let resources = &mut self.resources;
             let Some(capture) = resources.capture.as_mut() else {
@@ -680,7 +1062,9 @@ impl WorkerRuntime for ProductionRuntime {
                 .is_some()
         };
         if !frame_ready {
-            return Ok(());
+            return Ok(CaptureStepStatus {
+                calibration_active: self.calibration_active(),
+            });
         }
 
         let outcome = self
@@ -699,7 +1083,10 @@ impl WorkerRuntime for ProductionRuntime {
                 &mut resources.active_note,
                 events,
             )
-            .map_err(|error| RuntimeFailure::Other(format!("{error:#}")))
+            .map_err(|error| RuntimeFailure::Other(format!("{error:#}")))?;
+        Ok(CaptureStepStatus {
+            calibration_active: self.calibration_active(),
+        })
     }
 }
 
@@ -783,13 +1170,58 @@ impl OutcomeEventPublisher {
         events: &mut Vec<EngineEvent>,
         now: std::time::Instant,
     ) -> Result<()> {
-        let emit_audio_level = self.last_audio_level_at.map_or(true, |last| {
+        let emit_audio_level = self.should_emit_audio_level_at(now);
+        append_detector_outcome_events(outcome, midi, active_note, events, emit_audio_level)
+    }
+
+    fn publish_calibration_frame(&mut self, frame: &[f32], events: &mut Vec<EngineEvent>) {
+        self.publish_calibration_frame_at(frame, events, std::time::Instant::now());
+    }
+
+    fn publish_calibration_frame_at(
+        &mut self,
+        frame: &[f32],
+        events: &mut Vec<EngineEvent>,
+        now: std::time::Instant,
+    ) {
+        if !self.should_emit_audio_level_at(now) {
+            return;
+        }
+
+        let peak = frame
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+        events.push(EngineEvent::AudioLevel {
+            rms_dbfs: rms_db(frame),
+            peak_dbfs: peak_to_dbfs(peak),
+        });
+    }
+
+    fn should_emit_audio_level_at(&mut self, now: std::time::Instant) -> bool {
+        let emit = self.last_audio_level_at.map_or(true, |last| {
             now.saturating_duration_since(last) >= AUDIO_LEVEL_INTERVAL
         });
-        if emit_audio_level {
+        if emit {
             self.last_audio_level_at = Some(now);
         }
-        append_detector_outcome_events(outcome, midi, active_note, events, emit_audio_level)
+        emit
+    }
+}
+
+fn append_calibration_update(
+    update: CalibrationUpdate,
+    events: &mut Vec<EngineEvent>,
+) -> Option<CalibrationResult> {
+    match update {
+        CalibrationUpdate::Progress(progress) => {
+            events.push(EngineEvent::CalibrationProgress(progress));
+            None
+        }
+        CalibrationUpdate::NoteCompleted(note) => {
+            events.push(EngineEvent::CalibrationNoteCompleted(note));
+            None
+        }
+        CalibrationUpdate::Completed(result) => Some(result),
     }
 }
 
@@ -858,6 +1290,7 @@ fn default_run_args() -> RunArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::calibration::CalibrationSampleQuality;
     use std::{
         collections::HashMap,
         sync::{Arc, Mutex},
@@ -866,9 +1299,20 @@ mod tests {
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum FakeAction {
-        Start { mode: DetectorMode, device: String },
-        Stop { released_note: Option<u8> },
+        Start {
+            mode: DetectorMode,
+            device: String,
+        },
+        Stop {
+            released_note: Option<u8>,
+        },
         CaptureWait(Duration),
+        BeginCalibration {
+            samples_per_note: usize,
+            template_path: PathBuf,
+        },
+        RetryCalibrationSample,
+        CancelCalibration,
     }
 
     struct FakeRuntime {
@@ -877,6 +1321,8 @@ mod tests {
         capture_entered: Option<Sender<()>>,
         fail_first_start: bool,
         active_note: Option<u8>,
+        calibration_active: bool,
+        calibration_samples_per_note: usize,
     }
 
     #[derive(Default)]
@@ -909,6 +1355,8 @@ mod tests {
                 capture_entered: None,
                 fail_first_start: false,
                 active_note: None,
+                calibration_active: false,
+                calibration_samples_per_note: DEFAULT_SAMPLES_PER_NOTE,
             }
         }
 
@@ -968,11 +1416,83 @@ mod tests {
             Ok(())
         }
 
+        fn begin_calibration(
+            &mut self,
+            settings: &WorkerSettings,
+            samples_per_note: usize,
+            events: &mut Vec<EngineEvent>,
+        ) -> Result<(), RuntimeFailure> {
+            self.actions
+                .lock()
+                .unwrap()
+                .push(FakeAction::BeginCalibration {
+                    samples_per_note,
+                    template_path: settings.template_path.clone(),
+                });
+            self.calibration_active = true;
+            self.calibration_samples_per_note = samples_per_note;
+            events.push(EngineEvent::CalibrationProgress(CalibrationProgress {
+                requested_note: 36,
+                sample_index: 1,
+                samples_per_note,
+                accepted_samples_for_note: 0,
+                accepted_samples: 0,
+                required_samples: 37 * samples_per_note,
+                completed_notes: 0,
+                rms_dbfs: None,
+                peak: None,
+                quality: CalibrationSampleQuality::AwaitingOnset,
+            }));
+            Ok(())
+        }
+
+        fn retry_calibration_sample(
+            &mut self,
+            events: &mut Vec<EngineEvent>,
+        ) -> Result<(), String> {
+            if !self.calibration_active {
+                return Err("No calibration session is active".to_owned());
+            }
+            self.actions
+                .lock()
+                .unwrap()
+                .push(FakeAction::RetryCalibrationSample);
+            events.push(EngineEvent::CalibrationProgress(CalibrationProgress {
+                requested_note: 36,
+                sample_index: 1,
+                samples_per_note: self.calibration_samples_per_note,
+                accepted_samples_for_note: 0,
+                accepted_samples: 0,
+                required_samples: 37 * self.calibration_samples_per_note,
+                completed_notes: 0,
+                rms_dbfs: None,
+                peak: None,
+                quality: CalibrationSampleQuality::AwaitingOnset,
+            }));
+            Ok(())
+        }
+
+        fn cancel_calibration(&mut self, events: &mut Vec<EngineEvent>) -> bool {
+            if self.calibration_active {
+                self.actions
+                    .lock()
+                    .unwrap()
+                    .push(FakeAction::CancelCalibration);
+                self.calibration_active = false;
+                events.push(EngineEvent::CalibrationCancelled);
+            }
+            false
+        }
+
+        fn calibration_active(&self) -> bool {
+            self.calibration_active
+        }
+
         fn capture_step(
             &mut self,
             max_wait: Duration,
             events: &mut Vec<EngineEvent>,
-        ) -> Result<(), RuntimeFailure> {
+        ) -> Result<CaptureStepStatus, RuntimeFailure> {
             self.actions
                 .lock()
                 .unwrap()
@@ -980,12 +1500,14 @@ mod tests {
             if let Some(capture_entered) = self.capture_entered.take() {
                 let _ = capture_entered.send(());
             }
-            if self.active_note.is_none() {
+            if !self.calibration_active && self.active_note.is_none() {
                 self.active_note = Some(60);
                 events.push(EngineEvent::NoteOn { midi_note: 60 });
             }
             thread::sleep(max_wait);
-            Ok(())
+            Ok(CaptureStepStatus {
+                calibration_active: self.calibration_active,
+            })
         }
     }
 
@@ -1226,6 +1748,93 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn calibration_commands_release_midi_and_keep_retry_on_the_requested_sample() {
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = spawn_fake(FakeRuntime::new(Arc::clone(&actions)));
+        let template_path = PathBuf::from("/tmp/custom-pss-templates.json");
+        engine
+            .send(EngineCommand::SetTemplatePath {
+                path: template_path.clone(),
+            })
+            .unwrap();
+        engine.send(EngineCommand::Start).unwrap();
+        recv_until(&engine, |event| {
+            *event == EngineEvent::StateChanged(EngineState::Running)
+        });
+        assert_eq!(
+            recv_until(&engine, |event| *event
+                == EngineEvent::NoteOn { midi_note: 60 }),
+            EngineEvent::NoteOn { midi_note: 60 }
+        );
+
+        engine
+            .send(EngineCommand::BeginCalibration {
+                samples_per_note: 3,
+            })
+            .unwrap();
+        assert_eq!(
+            recv_until(&engine, |event| *event
+                == EngineEvent::NoteOff { midi_note: 60 }),
+            EngineEvent::NoteOff { midi_note: 60 }
+        );
+        recv_until(&engine, |event| {
+            *event == EngineEvent::StateChanged(EngineState::Stopped)
+        });
+        let initial_progress = recv_until(&engine, |event| {
+            matches!(event, EngineEvent::CalibrationProgress(_))
+        });
+        assert_eq!(
+            initial_progress,
+            EngineEvent::CalibrationProgress(CalibrationProgress {
+                requested_note: 36,
+                sample_index: 1,
+                samples_per_note: 3,
+                accepted_samples_for_note: 0,
+                accepted_samples: 0,
+                required_samples: 111,
+                completed_notes: 0,
+                rms_dbfs: None,
+                peak: None,
+                quality: CalibrationSampleQuality::AwaitingOnset,
+            })
+        );
+
+        engine.send(EngineCommand::RetryCalibrationSample).unwrap();
+        let retry_progress = recv_until(&engine, |event| {
+            matches!(event, EngineEvent::CalibrationProgress(_))
+        });
+        assert!(matches!(
+            retry_progress,
+            EngineEvent::CalibrationProgress(CalibrationProgress {
+                requested_note: 36,
+                sample_index: 1,
+                accepted_samples: 0,
+                quality: CalibrationSampleQuality::AwaitingOnset,
+                ..
+            })
+        ));
+
+        engine.send(EngineCommand::CancelCalibration).unwrap();
+        assert_eq!(
+            recv_until(&engine, |event| *event == EngineEvent::CalibrationCancelled),
+            EngineEvent::CalibrationCancelled
+        );
+        assert!(matches!(engine.try_recv_event(), Err(TryRecvError::Empty)));
+        engine.shutdown().unwrap();
+
+        let actions = actions.lock().unwrap();
+        assert!(actions.contains(&FakeAction::Stop {
+            released_note: Some(60),
+        }));
+        assert!(actions.contains(&FakeAction::BeginCalibration {
+            samples_per_note: 3,
+            template_path,
+        }));
+        assert!(actions.contains(&FakeAction::RetryCalibrationSample));
+        assert!(actions.contains(&FakeAction::CancelCalibration));
     }
 
     #[test]
@@ -1552,6 +2161,107 @@ mod tests {
             .iter()
             .any(|event| matches!(event, EngineEvent::AudioLevel { .. })));
         assert_eq!(midi.writes, vec![(true, 60)]);
+    }
+
+    #[test]
+    fn calibration_levels_are_measured_and_throttled_while_progress_stays_immediate() {
+        let mut publisher = OutcomeEventPublisher::default();
+        let mut events = Vec::new();
+        let start = Instant::now();
+        let progress = |quality| {
+            CalibrationUpdate::Progress(CalibrationProgress {
+                requested_note: 36,
+                sample_index: 1,
+                samples_per_note: 1,
+                accepted_samples_for_note: usize::from(
+                    quality == CalibrationSampleQuality::Accepted,
+                ),
+                accepted_samples: usize::from(quality == CalibrationSampleQuality::Accepted),
+                required_samples: 37,
+                completed_notes: 0,
+                rms_dbfs: None,
+                peak: None,
+                quality,
+            })
+        };
+
+        publisher.publish_calibration_frame_at(&[0.5, -0.5], &mut events, start);
+        append_calibration_update(
+            progress(CalibrationSampleQuality::AwaitingOnset),
+            &mut events,
+        );
+
+        // A frame 10 ms later is suppressed for the meter, but its progress
+        // event still passes through immediately.
+        publisher.publish_calibration_frame_at(
+            &[0.25, -0.25],
+            &mut events,
+            start + Duration::from_millis(10),
+        );
+        append_calibration_update(
+            progress(CalibrationSampleQuality::AwaitingOnset),
+            &mut events,
+        );
+
+        publisher.publish_calibration_frame_at(
+            &[0.25, -0.25],
+            &mut events,
+            start + AUDIO_LEVEL_INTERVAL,
+        );
+        append_calibration_update(progress(CalibrationSampleQuality::Accepted), &mut events);
+        append_calibration_update(
+            CalibrationUpdate::NoteCompleted(CalibrationNoteCompletion {
+                midi_note: 36,
+                completed_notes: 1,
+                total_notes: 37,
+                accepted_samples: 1,
+            }),
+            &mut events,
+        );
+
+        let levels: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::AudioLevel {
+                    rms_dbfs,
+                    peak_dbfs,
+                } => Some((*rms_dbfs, *peak_dbfs)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(levels.len(), 2);
+        assert!((levels[0].0 - -6.0206).abs() < 0.001);
+        assert!((levels[0].1 - -6.0206).abs() < 0.001);
+        assert!((levels[1].0 - -12.0412).abs() < 0.001);
+        assert!((levels[1].1 - -12.0412).abs() < 0.001);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, EngineEvent::CalibrationProgress(_)))
+                .count(),
+            3
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, EngineEvent::CalibrationNoteCompleted(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    EngineEvent::CalibrationProgress(progress) => Some(&progress.quality),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                &CalibrationSampleQuality::AwaitingOnset,
+                &CalibrationSampleQuality::AwaitingOnset,
+                &CalibrationSampleQuality::Accepted,
+            ]
+        );
     }
 
     #[test]
