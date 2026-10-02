@@ -294,6 +294,11 @@ impl AppState {
         }
     }
 
+    /// Select the UI page requested by the shell navigation.
+    pub fn select_page(&mut self, page: Page) {
+        self.page = page;
+    }
+
     /// Apply an engine update using a monotonic meter timestamp and the current
     /// wall clock for timestamping semantic event history.
     ///
@@ -613,6 +618,17 @@ mod tests {
         assert_eq!(state.config, config);
         assert_eq!(state.selected_audio_device, "hw:2,0");
         assert_eq!(state.engine_state, EngineState::Stopped);
+    }
+
+    #[test]
+    fn page_selection_updates_state_for_each_navigation_target() {
+        let mut state = AppState::default();
+        assert_eq!(state.page, Page::Live);
+
+        for page in [Page::Calibration, Page::Settings, Page::Live] {
+            state.select_page(page);
+            assert_eq!(state.page, page);
+        }
     }
 
     #[test]
