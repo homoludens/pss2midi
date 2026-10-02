@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use aubio::{Pitch, PitchMode, PitchUnit};
 
 pub use crate::engine::templates::RankedMatch;
@@ -228,6 +228,28 @@ pub struct Detector {
 
 impl Detector {
     pub fn new(args: &RunArgs, sample_rate: u32, hop: usize) -> Result<Self> {
+        let templates = if args.detector == DetectorMode::Yin {
+            None
+        } else {
+            let default_path;
+            let path = if let Some(path) = args.templates.as_deref() {
+                path
+            } else {
+                default_path = default_template_path();
+                default_path.as_path()
+            };
+            Some(TemplateFile::load(path)?)
+        };
+        Self::new_with_templates(args, sample_rate, hop, templates)
+    }
+
+    /// Construct a detector using templates already loaded by the worker.
+    pub fn new_with_templates(
+        args: &RunArgs,
+        sample_rate: u32,
+        hop: usize,
+        loaded_templates: Option<TemplateFile>,
+    ) -> Result<Self> {
         if args.detector != DetectorMode::Yin {
             ensure!(
                 args.spectral.spectral_delay_ms.is_finite()
@@ -273,14 +295,7 @@ impl Detector {
                 args.spectral.spectral_window_ms,
                 args.spectral.fft_size,
             )?;
-            let default_path;
-            let path = if let Some(path) = args.templates.as_deref() {
-                path
-            } else {
-                default_path = default_template_path();
-                default_path.as_path()
-            };
-            let templates = TemplateFile::load(path)?;
+            let templates = loaded_templates.context("Spectral templates have not been loaded")?;
             validate_for_extractor(&templates, &extractor, args.spectral.spectral_delay_ms)?;
             (Some(extractor), Some(templates))
         };

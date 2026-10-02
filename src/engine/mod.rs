@@ -24,4 +24,4 @@ pub use app_config::{
 };
 pub use audio_device::{AudioInputDevice, PIPEWIRE_DEFAULT_DEVICE_ID};
 pub use detector::{DetectorOutcome, NoteDecision, SpectralResult, YinDecision, YinResult};
-pub use worker::{EngineCommand, EngineEvent, EngineState, PssEngine};
+pub use worker::{EngineCommand, EngineEvent, EngineState, PssEngine, TemplateStatus};

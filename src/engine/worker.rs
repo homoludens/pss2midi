@@ -1,18 +1,22 @@
 //! GPUI-independent command and event boundary for the sound engine.
 
 use std::{
-    io,
+    fs, io,
     path::PathBuf,
     sync::mpsc::{self, Receiver, RecvError, RecvTimeoutError, SendError, Sender, TryRecvError},
     thread::{self, JoinHandle},
     time::Duration,
 };
 
+#[cfg(test)]
+use crate::engine::config::Cli;
 use anyhow::{Context, Result};
 use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
+#[cfg(test)]
 use clap::Parser;
 
 use crate::engine::{
+    app_config::AppConfig,
     audio_device::{
         choose_initial_device, is_selectable_device, AlsaAudioDeviceProvider, AudioDeviceProvider,
         AudioDeviceUnavailable, AudioInputDevice, OpenedAudioCapture, PIPEWIRE_DEFAULT_DEVICE_ID,
@@ -21,11 +25,15 @@ use crate::engine::{
         CalibrationNoteCompletion, CalibrationProgress, CalibrationResult, CalibrationSession,
         CalibrationUpdate, DEFAULT_SAMPLES_PER_NOTE,
     },
-    config::{default_template_path, Cli, DetectorMode, RunArgs},
+    config::{default_template_path, DetectorMode, RunArgs},
     detector::{Detector, DetectorOutcome, NoteDecision, SpectralResult, YinResult},
-    midi::{Midi, OUTPUT_NAME as MIDI_OUTPUT_NAME},
+    features::FeatureExtractor,
+    midi::{
+        MidiOutputProvider, MidiPort, SystemMidiOutputProvider, OUTPUT_NAME as MIDI_OUTPUT_NAME,
+    },
     note::rms_db,
     persistence::TemplatePersistenceTask,
+    templates::{validate_for_extractor, TemplateFile},
 };
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -57,6 +65,14 @@ pub enum EngineState {
     ShuttingDown,
 }
 
+/// Availability of the configured spectral-template file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TemplateStatus {
+    NotCalibrated { path: PathBuf },
+    Loaded { path: PathBuf },
+    Error { path: PathBuf, message: String },
+}
+
 /// High-level updates that can be consumed by a UI or another client.
 #[derive(Clone, Debug, PartialEq)]
 pub enum EngineEvent {
@@ -71,6 +87,7 @@ pub enum EngineEvent {
     MidiOutputUnavailable {
         message: String,
     },
+    TemplateStatusChanged(TemplateStatus),
     Onset,
     Detection {
         selected_note: Option<u8>,
@@ -130,18 +147,33 @@ pub struct PssEngine {
 }
 
 impl PssEngine {
-    /// Start an idle worker without opening audio or MIDI devices.
+    /// Start an idle worker with safe default settings.
     pub fn new() -> io::Result<Self> {
-        Self::new_with_audio_device_preference(None)
+        Self::new_with_config(AppConfig::default())
     }
 
     /// Start an idle worker, preferring `saved_device_id` when ALSA reports it.
     /// If it is unavailable, the established PipeWire default is selected.
     pub fn new_with_audio_device_preference(saved_device_id: Option<String>) -> io::Result<Self> {
-        let args = default_run_args();
-        let settings = WorkerSettings::from_args_and_preference(&args, saved_device_id);
+        let mut config = AppConfig::default();
+        if let Some(device) = saved_device_id {
+            config.audio.device = device;
+        }
+        Self::new_with_config(config)
+    }
+
+    /// Start a worker using the complete persisted desktop configuration.
+    pub fn new_with_config(config: AppConfig) -> io::Result<Self> {
+        let args = config.to_run_args();
+        let settings = WorkerSettings::from_app_config(config);
         Self::spawn_with_runtime(
-            move || ProductionRuntime::new(args, Box::<AlsaAudioDeviceProvider>::default()),
+            move || {
+                ProductionRuntime::new(
+                    args,
+                    Box::<AlsaAudioDeviceProvider>::default(),
+                    Box::<SystemMidiOutputProvider>::default(),
+                )
+            },
             settings,
         )
     }
@@ -241,8 +273,10 @@ impl Drop for PssEngine {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct WorkerSettings {
+    /// All mapped runtime settings are retained between Start/Stop cycles.
+    args: RunArgs,
     mode: DetectorMode,
     device: String,
     template_path: PathBuf,
@@ -257,12 +291,28 @@ impl WorkerSettings {
         Self::from_args_and_preference(args, None)
     }
 
+    #[cfg(test)]
     fn from_args_and_preference(args: &RunArgs, preferred_device: Option<String>) -> Self {
+        let template_path = args.templates.clone().unwrap_or_else(default_template_path);
         Self {
+            args: args.clone(),
             mode: args.detector,
             device: args.audio.device.clone(),
-            template_path: default_template_path(),
+            template_path,
             preferred_device,
+            pending_device: None,
+            device_selection_resolved: false,
+        }
+    }
+
+    fn from_app_config(config: AppConfig) -> Self {
+        let args = config.to_run_args();
+        Self {
+            args,
+            mode: config.detector_mode,
+            device: config.audio.device.clone(),
+            template_path: config.template_path.clone(),
+            preferred_device: Some(config.audio.device),
             pending_device: None,
             device_selection_resolved: false,
         }
@@ -289,9 +339,18 @@ impl RuntimeFailure {
 /// Runtime operations are injectable so the worker's lifecycle and command
 /// scheduling can be exercised without ALSA or MIDI hardware.
 trait WorkerRuntime: 'static {
+    fn initialize(&mut self, _settings: &WorkerSettings, _events: &mut Vec<EngineEvent>) {}
     fn enumerate_audio_devices(&mut self) -> Result<Vec<AudioInputDevice>, String>;
-    fn start(&mut self, settings: &WorkerSettings) -> Result<(), RuntimeFailure>;
+    fn start(
+        &mut self,
+        settings: &WorkerSettings,
+        events: &mut Vec<EngineEvent>,
+    ) -> Result<(), RuntimeFailure>;
     fn stop(&mut self, events: &mut Vec<EngineEvent>) -> Result<(), String>;
+    fn shutdown(&mut self) -> bool {
+        false
+    }
+    fn set_template_path(&mut self, _settings: &WorkerSettings, _events: &mut Vec<EngineEvent>) {}
     fn begin_calibration(
         &mut self,
         _settings: &WorkerSettings,
@@ -335,6 +394,9 @@ fn run_worker<R>(
     R: WorkerRuntime,
 {
     let _ = event_tx.send(EngineEvent::WorkerStarted);
+    let mut startup_events = Vec::new();
+    runtime.initialize(&settings, &mut startup_events);
+    publish_events(&event_tx, startup_events);
     let mut running = false;
     let mut calibrating = false;
 
@@ -416,6 +478,7 @@ fn run_worker<R>(
                 }
                 let mut next_settings = settings.clone();
                 next_settings.mode = mode;
+                next_settings.args.detector = mode;
                 running = reconfigure_runtime(
                     &mut runtime,
                     &event_tx,
@@ -446,7 +509,25 @@ fn run_worker<R>(
             EngineCommand::RetryAudioDevice => {
                 running = retry_audio_device(&mut runtime, &event_tx, &mut settings, running);
             }
-            EngineCommand::SetTemplatePath { path } => settings.template_path = path,
+            EngineCommand::SetTemplatePath { path } => {
+                let mut next_settings = settings.clone();
+                next_settings.template_path = path.clone();
+                next_settings.args.templates = Some(path);
+                let mut events = Vec::new();
+                runtime.set_template_path(&next_settings, &mut events);
+                publish_events(&event_tx, events);
+                if running && next_settings.mode != DetectorMode::Yin {
+                    running = reconfigure_runtime(
+                        &mut runtime,
+                        &event_tx,
+                        &mut settings,
+                        next_settings,
+                        true,
+                    );
+                } else {
+                    settings = next_settings;
+                }
+            }
             EngineCommand::BeginCalibration { samples_per_note } => {
                 if running {
                     stop_runtime(&mut runtime, &event_tx);
@@ -520,6 +601,9 @@ fn run_worker<R>(
         runtime.cancel_calibration(&mut events);
         publish_events(&event_tx, events);
     }
+    if runtime.shutdown() {
+        let _ = event_tx.send(EngineEvent::MidiOutputClosed);
+    }
     drop(runtime);
     let _ = event_tx.send(EngineEvent::WorkerStopped);
 }
@@ -529,11 +613,11 @@ fn start_runtime<R: WorkerRuntime>(
     settings: &WorkerSettings,
     event_tx: &EngineEventSender,
 ) -> bool {
-    match runtime.start(settings) {
+    let mut events = Vec::new();
+    let result = runtime.start(settings, &mut events);
+    publish_events(event_tx, events);
+    match result {
         Ok(()) => {
-            let _ = event_tx.send(EngineEvent::MidiOutputOpened {
-                name: MIDI_OUTPUT_NAME.to_owned(),
-            });
             let _ = event_tx.send(EngineEvent::AudioDeviceOpened {
                 device_id: settings.device.clone(),
             });
@@ -560,6 +644,7 @@ fn resolve_initial_device<R: WorkerRuntime>(
     match runtime.enumerate_audio_devices() {
         Ok(devices) => {
             settings.device = choose_initial_device(&devices, settings.preferred_device.as_deref());
+            settings.args.audio.device = settings.device.clone();
             settings.preferred_device = None;
             settings.device_selection_resolved = true;
             let _ = event_tx.send(EngineEvent::AudioDevicesEnumerated {
@@ -573,6 +658,7 @@ fn resolve_initial_device<R: WorkerRuntime>(
             // temporarily unavailable. Opening it still has to succeed before
             // the worker reports the device as active.
             settings.device = PIPEWIRE_DEFAULT_DEVICE_ID.to_owned();
+            settings.args.audio.device = settings.device.clone();
             settings.preferred_device = None;
             settings.device_selection_resolved = true;
         }
@@ -589,6 +675,7 @@ fn enumerate_audio_devices<R: WorkerRuntime>(
             if !settings.device_selection_resolved {
                 settings.device =
                     choose_initial_device(&devices, settings.preferred_device.as_deref());
+                settings.args.audio.device = settings.device.clone();
                 settings.preferred_device = None;
                 settings.pending_device = None;
                 settings.device_selection_resolved = true;
@@ -629,6 +716,7 @@ fn select_audio_device<R: WorkerRuntime>(
 
     let mut next_settings = settings.clone();
     next_settings.device = device_id.clone();
+    next_settings.args.audio.device = device_id.clone();
     next_settings.preferred_device = None;
     next_settings.pending_device = None;
     next_settings.device_selection_resolved = true;
@@ -670,6 +758,7 @@ fn retry_audio_device<R: WorkerRuntime>(
 
     let mut next_settings = settings.clone();
     next_settings.device = target_device.clone();
+    next_settings.args.audio.device = target_device.clone();
     next_settings.preferred_device = None;
     next_settings.pending_device = None;
     next_settings.device_selection_resolved = true;
@@ -728,7 +817,6 @@ fn stop_runtime<R: WorkerRuntime>(runtime: &mut R, event_tx: &EngineEventSender)
     let mut events = Vec::new();
     let result = runtime.stop(&mut events);
     publish_events(event_tx, events);
-    let _ = event_tx.send(EngineEvent::MidiOutputClosed);
     if let Err(message) = result {
         let _ = event_tx.send(EngineEvent::Error { message });
         false
@@ -769,11 +857,15 @@ fn publish_events(event_tx: &EngineEventSender, events: Vec<EngineEvent>) {
 struct ProductionRuntime {
     args: RunArgs,
     audio_device_provider: Box<dyn AudioDeviceProvider>,
+    midi_output_provider: Box<dyn MidiOutputProvider>,
+    midi: Option<Box<dyn MidiPort>>,
     resources: WorkerResources,
     outcome_publisher: OutcomeEventPublisher,
     calibration: Option<CalibrationSession>,
     pending_template_saves: Vec<PendingTemplateSave>,
     current_template_path: PathBuf,
+    templates: Option<TemplateFile>,
+    template_status: TemplateStatus,
 }
 
 struct PendingTemplateSave {
@@ -784,16 +876,75 @@ struct PendingTemplateSave {
 }
 
 impl ProductionRuntime {
-    fn new(args: RunArgs, audio_device_provider: Box<dyn AudioDeviceProvider>) -> Self {
+    fn new(
+        args: RunArgs,
+        audio_device_provider: Box<dyn AudioDeviceProvider>,
+        midi_output_provider: Box<dyn MidiOutputProvider>,
+    ) -> Self {
+        let current_template_path = args.templates.clone().unwrap_or_else(default_template_path);
         Self {
             args,
             audio_device_provider,
+            midi_output_provider,
+            midi: None,
             resources: WorkerResources::default(),
             outcome_publisher: OutcomeEventPublisher::default(),
             calibration: None,
             pending_template_saves: Vec::new(),
-            current_template_path: default_template_path(),
+            current_template_path: current_template_path.clone(),
+            templates: None,
+            template_status: TemplateStatus::NotCalibrated {
+                path: current_template_path,
+            },
         }
+    }
+
+    fn update_template_status(&mut self, args: &RunArgs, events: &mut Vec<EngineEvent>) {
+        let (templates, status) = load_configured_templates(&self.current_template_path, args);
+        self.templates = templates;
+        self.template_status = status.clone();
+        events.push(EngineEvent::TemplateStatusChanged(status));
+    }
+
+    fn ensure_midi(&mut self) -> Result<bool, String> {
+        if self.midi.is_some() {
+            return Ok(false);
+        }
+        let output = self
+            .midi_output_provider
+            .open_output()
+            .map_err(|error| format!("{error:#}"))?;
+        self.midi = Some(output);
+        Ok(true)
+    }
+
+    fn validate_templates_for_start(&self, actual_sample_rate: Option<u32>) -> Result<(), String> {
+        if self.args.detector == DetectorMode::Yin {
+            return Ok(());
+        }
+        let templates = self
+            .templates
+            .as_ref()
+            .ok_or_else(|| match &self.template_status {
+                TemplateStatus::NotCalibrated { path } => {
+                    format!("Spectral templates are not calibrated: {}", path.display())
+                }
+                TemplateStatus::Error { message, .. } => message.clone(),
+                TemplateStatus::Loaded { path } => {
+                    format!("Spectral templates could not be loaded: {}", path.display())
+                }
+            })?;
+        if let Some(sample_rate) = actual_sample_rate {
+            let extractor = FeatureExtractor::new(
+                sample_rate,
+                self.args.spectral.spectral_window_ms,
+                self.args.spectral.fft_size,
+            )
+            .map_err(|error| format!("{error:#}"))?;
+            validate_for_extractor(templates, &extractor, self.args.spectral.spectral_delay_ms)
+                .map_err(|error| format!("{error:#}"))?;
+        }
+        Ok(())
     }
 
     fn clear_calibration_capture(&mut self) {
@@ -904,21 +1055,98 @@ impl ProductionRuntime {
         if decisions.is_empty() {
             return Ok(());
         }
-        let resources = &mut self.resources;
-        let midi = resources.midi.as_mut().context("MIDI output is not open")?;
-        apply_note_decisions(midi, &mut resources.active_note, decisions, events)
+        let midi = self
+            .midi
+            .as_deref_mut()
+            .context("MIDI output is not open")?;
+        apply_note_decisions(midi, &mut self.resources.active_note, decisions, events)
+    }
+}
+
+fn load_configured_templates(
+    path: &std::path::Path,
+    args: &RunArgs,
+) -> (Option<TemplateFile>, TemplateStatus) {
+    let make_error = |message: String| TemplateStatus::Error {
+        path: path.to_path_buf(),
+        message,
+    };
+    match fs::metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return (
+                None,
+                TemplateStatus::NotCalibrated {
+                    path: path.to_path_buf(),
+                },
+            );
+        }
+        Err(error) => {
+            return (
+                None,
+                make_error(format!("Cannot inspect template file: {error}")),
+            );
+        }
+        Ok(_) => {}
+    }
+
+    let loaded = TemplateFile::load(path).and_then(|templates| {
+        let extractor = FeatureExtractor::new(
+            args.audio.sample_rate,
+            args.spectral.spectral_window_ms,
+            args.spectral.fft_size,
+        )?;
+        validate_for_extractor(&templates, &extractor, args.spectral.spectral_delay_ms)?;
+        Ok(templates)
+    });
+    match loaded {
+        Ok(templates) => (
+            Some(templates),
+            TemplateStatus::Loaded {
+                path: path.to_path_buf(),
+            },
+        ),
+        Err(error) => (None, make_error(format!("{error:#}"))),
     }
 }
 
 impl WorkerRuntime for ProductionRuntime {
+    fn initialize(&mut self, settings: &WorkerSettings, events: &mut Vec<EngineEvent>) {
+        self.args = settings.args.clone();
+        self.current_template_path = settings.template_path.clone();
+        self.update_template_status(&settings.args, events);
+        match self.ensure_midi() {
+            Ok(_) => events.push(EngineEvent::MidiOutputOpened {
+                name: MIDI_OUTPUT_NAME.to_owned(),
+            }),
+            Err(message) => events.push(EngineEvent::MidiOutputUnavailable { message }),
+        }
+    }
+
     fn enumerate_audio_devices(&mut self) -> Result<Vec<AudioInputDevice>, String> {
         self.audio_device_provider.enumerate_capture_devices()
     }
 
-    fn start(&mut self, settings: &WorkerSettings) -> Result<(), RuntimeFailure> {
-        let mut args = self.args.clone();
-        args.detector = settings.mode;
-        args.audio.device = settings.device.clone();
+    fn set_template_path(&mut self, settings: &WorkerSettings, events: &mut Vec<EngineEvent>) {
+        self.args = settings.args.clone();
+        self.current_template_path = settings.template_path.clone();
+        self.update_template_status(&settings.args, events);
+    }
+
+    fn start(
+        &mut self,
+        settings: &WorkerSettings,
+        events: &mut Vec<EngineEvent>,
+    ) -> Result<(), RuntimeFailure> {
+        let args = settings.args.clone();
+        self.args = args.clone();
+        self.current_template_path = settings.template_path.clone();
+        self.validate_templates_for_start(None)
+            .map_err(RuntimeFailure::Other)?;
+        if self.ensure_midi().map_err(RuntimeFailure::MidiOutput)? {
+            events.push(EngineEvent::MidiOutputOpened {
+                name: MIDI_OUTPUT_NAME.to_owned(),
+            });
+        }
 
         // Construct into locals so a partial failure drops everything opened
         // for this attempted start and leaves the runtime stopped.
@@ -928,16 +1156,25 @@ impl WorkerRuntime for ProductionRuntime {
             .map_err(RuntimeFailure::AudioDevice)?;
         let sample_rate = capture.sample_rate;
         let hop = capture.hop;
-        let midi = Midi::new().map_err(|error| RuntimeFailure::MidiOutput(format!("{error:#}")))?;
-        let detector = Detector::new(&args, sample_rate, hop)
-            .context("Cannot create detector")
-            .map_err(|error| RuntimeFailure::Other(format!("{error:#}")))?;
+        if let Err(message) = self.validate_templates_for_start(Some(sample_rate)) {
+            if args.detector != DetectorMode::Yin {
+                let status = TemplateStatus::Error {
+                    path: self.current_template_path.clone(),
+                    message: message.clone(),
+                };
+                self.template_status = status.clone();
+                events.push(EngineEvent::TemplateStatusChanged(status));
+            }
+            return Err(RuntimeFailure::Other(message));
+        }
+        let detector =
+            Detector::new_with_templates(&args, sample_rate, hop, self.templates.clone())
+                .context("Cannot create detector")
+                .map_err(|error| RuntimeFailure::Other(format!("{error:#}")))?;
 
-        self.args = args;
         self.resources = WorkerResources {
             capture: Some(capture),
             detector: Some(detector),
-            midi: Some(midi),
             active_note: None,
             frame: vec![0.0; hop],
             active_device: Some(settings.device.clone()),
@@ -952,8 +1189,8 @@ impl WorkerRuntime for ProductionRuntime {
         samples_per_note: usize,
         events: &mut Vec<EngineEvent>,
     ) -> Result<(), RuntimeFailure> {
-        let mut audio = self.args.audio.clone();
-        audio.device = settings.device.clone();
+        self.args = settings.args.clone();
+        let audio = self.args.audio.clone();
         let capture = self
             .audio_device_provider
             .open_capture(&settings.device, &audio)
@@ -972,7 +1209,6 @@ impl WorkerRuntime for ProductionRuntime {
         self.resources = WorkerResources {
             capture: Some(capture),
             detector: None,
-            midi: None,
             active_note: None,
             frame: vec![0.0; hop],
             active_device: Some(settings.device.clone()),
@@ -1022,6 +1258,10 @@ impl WorkerRuntime for ProductionRuntime {
         ProductionRuntime::calibration_active(self)
     }
 
+    fn shutdown(&mut self) -> bool {
+        self.midi.take().is_some()
+    }
+
     fn stop(&mut self, events: &mut Vec<EngineEvent>) -> Result<(), String> {
         let decisions = self
             .resources
@@ -1035,7 +1275,7 @@ impl WorkerRuntime for ProductionRuntime {
             .map(|error| format!("{error:#}"));
 
         if self.resources.active_note.is_some() {
-            let release_result = match self.resources.midi.as_mut() {
+            let release_result = match self.midi.as_deref_mut() {
                 Some(midi) => release_active_note(midi, &mut self.resources.active_note, events),
                 None => Err(anyhow::anyhow!(
                     "MIDI output is not open for active note release"
@@ -1051,7 +1291,6 @@ impl WorkerRuntime for ProductionRuntime {
         // Notes are released before any of the old resources are dropped.
         self.resources.detector.take();
         self.resources.capture.take();
-        self.resources.midi.take();
         self.resources.active_note = None;
         self.resources.active_device = None;
         self.resources.frame.clear();
@@ -1119,7 +1358,7 @@ impl WorkerRuntime for ProductionRuntime {
         self.outcome_publisher
             .publish(
                 &outcome,
-                resources.midi.as_mut(),
+                self.midi.as_deref_mut(),
                 &mut resources.active_note,
                 events,
             )
@@ -1134,28 +1373,12 @@ impl WorkerRuntime for ProductionRuntime {
 struct WorkerResources {
     capture: Option<OpenedAudioCapture>,
     detector: Option<Detector>,
-    midi: Option<Midi>,
     active_note: Option<u8>,
     frame: Vec<f32>,
     active_device: Option<String>,
 }
 
-trait MidiPort {
-    fn note_on(&mut self, note: u8) -> Result<()>;
-    fn note_off(&mut self, note: u8) -> Result<()>;
-}
-
-impl MidiPort for Midi {
-    fn note_on(&mut self, note: u8) -> Result<()> {
-        Midi::note_on(self, note)
-    }
-
-    fn note_off(&mut self, note: u8) -> Result<()> {
-        Midi::note_off(self, note)
-    }
-}
-
-fn apply_note_decisions<M: MidiPort>(
+fn apply_note_decisions<M: MidiPort + ?Sized>(
     midi: &mut M,
     active_note: &mut Option<u8>,
     decisions: &[NoteDecision],
@@ -1186,7 +1409,7 @@ struct OutcomeEventPublisher {
 }
 
 impl OutcomeEventPublisher {
-    fn publish<M: MidiPort>(
+    fn publish<M: MidiPort + ?Sized>(
         &mut self,
         outcome: &DetectorOutcome,
         midi: Option<&mut M>,
@@ -1202,7 +1425,7 @@ impl OutcomeEventPublisher {
         )
     }
 
-    fn publish_at<M: MidiPort>(
+    fn publish_at<M: MidiPort + ?Sized>(
         &mut self,
         outcome: &DetectorOutcome,
         midi: Option<&mut M>,
@@ -1265,7 +1488,7 @@ fn append_calibration_update(
     }
 }
 
-fn append_detector_outcome_events<M: MidiPort>(
+fn append_detector_outcome_events<M: MidiPort + ?Sized>(
     outcome: &DetectorOutcome,
     midi: Option<&mut M>,
     active_note: &mut Option<u8>,
@@ -1308,7 +1531,7 @@ fn peak_to_dbfs(peak: f32) -> f32 {
     20.0 * peak.max(1e-6).log10()
 }
 
-fn release_active_note<M: MidiPort>(
+fn release_active_note<M: MidiPort + ?Sized>(
     midi: &mut M,
     active_note: &mut Option<u8>,
     events: &mut Vec<EngineEvent>,
@@ -1321,6 +1544,7 @@ fn release_active_note<M: MidiPort>(
     Ok(())
 }
 
+#[cfg(test)]
 fn default_run_args() -> RunArgs {
     Cli::try_parse_from(["pss2midi"])
         .expect("the built-in engine defaults must be valid")
@@ -1333,7 +1557,10 @@ mod tests {
     use crate::engine::calibration::CalibrationSampleQuality;
     use std::{
         collections::HashMap,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
         time::Instant,
     };
 
@@ -1361,6 +1588,7 @@ mod tests {
         capture_entered: Option<Sender<()>>,
         fail_first_start: bool,
         fail_midi_start: bool,
+        midi_open: bool,
         active_note: Option<u8>,
         calibration_active: bool,
         calibration_samples_per_note: usize,
@@ -1396,6 +1624,7 @@ mod tests {
                 capture_entered: None,
                 fail_first_start: false,
                 fail_midi_start: false,
+                midi_open: false,
                 active_note: None,
                 calibration_active: false,
                 calibration_samples_per_note: DEFAULT_SAMPLES_PER_NOTE,
@@ -1430,7 +1659,11 @@ mod tests {
             Ok(self.provider_state.lock().unwrap().devices.clone())
         }
 
-        fn start(&mut self, settings: &WorkerSettings) -> Result<(), RuntimeFailure> {
+        fn start(
+            &mut self,
+            settings: &WorkerSettings,
+            events: &mut Vec<EngineEvent>,
+        ) -> Result<(), RuntimeFailure> {
             self.actions.lock().unwrap().push(FakeAction::Start {
                 mode: settings.mode,
                 device: settings.device.clone(),
@@ -1454,6 +1687,13 @@ mod tests {
                         "mock capture open failed",
                     ));
                 }
+            }
+            drop(provider_state);
+            if !self.midi_open {
+                self.midi_open = true;
+                events.push(EngineEvent::MidiOutputOpened {
+                    name: MIDI_OUTPUT_NAME.to_owned(),
+                });
             }
             Ok(())
         }
@@ -1579,6 +1819,49 @@ mod tests {
         }
     }
 
+    struct FakeMidiOutputProvider {
+        error: Option<String>,
+        open_count: Arc<AtomicUsize>,
+    }
+
+    impl MidiOutputProvider for FakeMidiOutputProvider {
+        fn open_output(&mut self) -> Result<Box<dyn MidiPort>> {
+            self.open_count.fetch_add(1, Ordering::Relaxed);
+            if let Some(message) = &self.error {
+                anyhow::bail!(message.clone());
+            }
+            Ok(Box::new(FakeMidi { writes: Vec::new() }))
+        }
+    }
+
+    impl FakeMidiOutputProvider {
+        fn available() -> (Self, Arc<AtomicUsize>) {
+            let open_count = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    error: None,
+                    open_count: Arc::clone(&open_count),
+                },
+                open_count,
+            )
+        }
+
+        fn failing(message: impl Into<String>) -> Self {
+            Self {
+                error: Some(message.into()),
+                open_count: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    fn unique_test_path(label: &str) -> PathBuf {
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is before the Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("pss2midi-{label}-{}-{id}.json", std::process::id()))
+    }
+
     fn spawn_fake(runtime: FakeRuntime) -> PssEngine {
         let args = default_run_args();
         PssEngine::spawn_with_runtime(move || runtime, WorkerSettings::from_args(&args)).unwrap()
@@ -1593,6 +1876,142 @@ mod tests {
             id: id.to_owned(),
             label: label.to_owned(),
         }
+    }
+
+    #[test]
+    fn startup_with_missing_templates_and_yin_reports_nonfatal_calibration_state_and_midi_status() {
+        let mut config = AppConfig::default();
+        config.template_path = unique_test_path("missing-templates");
+        let settings = WorkerSettings::from_app_config(config.clone());
+        let (midi_provider, _) = FakeMidiOutputProvider::available();
+        let mut runtime = ProductionRuntime::new(
+            config.to_run_args(),
+            Box::<AlsaAudioDeviceProvider>::default(),
+            Box::new(midi_provider),
+        );
+        let mut events = Vec::new();
+
+        runtime.initialize(&settings, &mut events);
+
+        assert!(events.contains(&EngineEvent::TemplateStatusChanged(
+            TemplateStatus::NotCalibrated {
+                path: config.template_path
+            }
+        )));
+        assert!(events.contains(&EngineEvent::MidiOutputOpened {
+            name: MIDI_OUTPUT_NAME.to_owned(),
+        }));
+        assert!(runtime.validate_templates_for_start(None).is_ok());
+        assert!(runtime.midi.is_some());
+    }
+
+    #[test]
+    fn invalid_template_file_reports_error_without_blocking_yin_or_midi_initialization() {
+        let path = unique_test_path("invalid-templates");
+        fs::write(&path, "{invalid json").unwrap();
+        let mut config = AppConfig::default();
+        config.template_path = path.clone();
+        let settings = WorkerSettings::from_app_config(config.clone());
+        let (midi_provider, _) = FakeMidiOutputProvider::available();
+        let mut runtime = ProductionRuntime::new(
+            config.to_run_args(),
+            Box::<AlsaAudioDeviceProvider>::default(),
+            Box::new(midi_provider),
+        );
+        let mut events = Vec::new();
+
+        runtime.initialize(&settings, &mut events);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::TemplateStatusChanged(TemplateStatus::Error {
+                path: error_path,
+                ..
+            }) if error_path == &path
+        )));
+        assert!(events.contains(&EngineEvent::MidiOutputOpened {
+            name: MIDI_OUTPUT_NAME.to_owned(),
+        }));
+        assert!(runtime.validate_templates_for_start(None).is_ok());
+        assert!(runtime.midi.is_some());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn valid_template_file_is_loaded_and_reported_at_worker_startup() {
+        let path = unique_test_path("valid-templates");
+        let extractor = FeatureExtractor::new(48_000, 30.0, 2048).unwrap();
+        let mut templates = TemplateFile::empty(48_000, 2048, 30.0, 8.0);
+        for note in 36..=72 {
+            templates
+                .notes
+                .insert(note, vec![vec![1.0; extractor.feature_len()]]);
+        }
+        templates.save(&path).unwrap();
+        let mut config = AppConfig::default();
+        config.template_path = path.clone();
+        let settings = WorkerSettings::from_app_config(config.clone());
+        let (midi_provider, _) = FakeMidiOutputProvider::available();
+        let mut runtime = ProductionRuntime::new(
+            config.to_run_args(),
+            Box::<AlsaAudioDeviceProvider>::default(),
+            Box::new(midi_provider),
+        );
+        let mut events = Vec::new();
+
+        runtime.initialize(&settings, &mut events);
+
+        assert!(events.contains(&EngineEvent::TemplateStatusChanged(
+            TemplateStatus::Loaded { path: path.clone() }
+        )));
+        assert!(runtime.templates.is_some());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn midi_initialization_failure_reports_unavailable_and_never_reports_connected() {
+        let mut config = AppConfig::default();
+        config.template_path = unique_test_path("midi-status");
+        let settings = WorkerSettings::from_app_config(config.clone());
+        let mut runtime = ProductionRuntime::new(
+            config.to_run_args(),
+            Box::<AlsaAudioDeviceProvider>::default(),
+            Box::new(FakeMidiOutputProvider::failing(
+                "injected MIDI creation failure",
+            )),
+        );
+        let mut events = Vec::new();
+
+        runtime.initialize(&settings, &mut events);
+
+        assert!(events.contains(&EngineEvent::MidiOutputUnavailable {
+            message: "injected MIDI creation failure".to_owned(),
+        }));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::MidiOutputOpened { .. })));
+        assert!(runtime.midi.is_none());
+    }
+
+    #[test]
+    fn worker_reuses_open_midi_output_and_recreates_it_after_close() {
+        let config = AppConfig::default();
+        let settings = WorkerSettings::from_app_config(config.clone());
+        let (midi_provider, open_count) = FakeMidiOutputProvider::available();
+        let mut runtime = ProductionRuntime::new(
+            config.to_run_args(),
+            Box::<AlsaAudioDeviceProvider>::default(),
+            Box::new(midi_provider),
+        );
+
+        runtime.initialize(&settings, &mut Vec::new());
+        assert_eq!(open_count.load(Ordering::Relaxed), 1);
+        assert!(!runtime.ensure_midi().unwrap());
+        assert_eq!(open_count.load(Ordering::Relaxed), 1);
+
+        assert!(runtime.shutdown());
+        assert!(runtime.ensure_midi().unwrap());
+        assert_eq!(open_count.load(Ordering::Relaxed), 2);
     }
 
     fn recv_until(
@@ -1807,7 +2226,7 @@ mod tests {
     }
 
     #[test]
-    fn midi_output_events_report_open_close_and_recoverable_creation_failure() {
+    fn midi_output_events_report_creation_failure_and_keep_open_output_connected_while_stopped() {
         let actions = Arc::new(Mutex::new(Vec::new()));
         let mut runtime = FakeRuntime::new(Arc::clone(&actions));
         runtime.fail_midi_start();
@@ -1845,9 +2264,11 @@ mod tests {
 
         engine.send(EngineCommand::Stop).unwrap();
         assert_eq!(
-            recv_until(&engine, |event| *event == EngineEvent::MidiOutputClosed),
-            EngineEvent::MidiOutputClosed
+            recv_until(&engine, |event| *event
+                == EngineEvent::StateChanged(EngineState::Stopped)),
+            EngineEvent::StateChanged(EngineState::Stopped)
         );
+        assert!(matches!(engine.try_recv_event(), Err(TryRecvError::Empty)));
         engine.shutdown().unwrap();
     }
 

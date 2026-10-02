@@ -12,7 +12,7 @@ use crate::engine::{
     config::DetectorMode,
     detector::{SpectralResult, YinResult},
     note::note_name,
-    AudioInputDevice, EngineCommand, EngineEvent, EngineState,
+    AudioInputDevice, EngineCommand, EngineEvent, EngineState, TemplateStatus,
 };
 
 /// Maximum number of high-level events retained for the recent-event panel.
@@ -40,6 +40,7 @@ pub enum ErrorKind {
     AudioDevice,
     AudioDeviceEnumeration,
     MidiOutput,
+    Template,
     Calibration,
 }
 
@@ -79,6 +80,16 @@ pub fn engine_command_for_action(
         LiveControlAction::RetryAudioDevice => Some(EngineCommand::RetryAudioDevice),
         LiveControlAction::SetDetectorMode(mode) => Some(EngineCommand::SetDetectorMode(mode)),
     }
+}
+
+/// Commands issued after the worker is constructed. Enumeration always runs;
+/// saved auto-start only adds a Start request after it in worker queue order.
+pub fn startup_engine_commands(config: &AppConfig) -> Vec<EngineCommand> {
+    let mut commands = vec![EngineCommand::EnumerateAudioDevices];
+    if config.auto_start {
+        commands.push(EngineCommand::Start);
+    }
+    commands
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -177,6 +188,7 @@ pub enum RecentEventKind {
     MidiOutputUnavailable {
         message: String,
     },
+    TemplateStatusChanged(TemplateStatus),
     Onset,
     Detection(DetectionSnapshot),
     NoteOn {
@@ -250,6 +262,17 @@ impl RecentEvent {
             RecentEventKind::MidiOutputUnavailable { message } => {
                 format!("MIDI output unavailable: {message}")
             }
+            RecentEventKind::TemplateStatusChanged(status) => match status {
+                TemplateStatus::NotCalibrated { path } => {
+                    format!("Spectral templates not calibrated: {}", path.display())
+                }
+                TemplateStatus::Loaded { path } => {
+                    format!("Spectral templates loaded: {}", path.display())
+                }
+                TemplateStatus::Error { path, message } => {
+                    format!("Spectral template error at {}: {message}", path.display())
+                }
+            },
             RecentEventKind::Onset => "Onset detected".to_owned(),
             RecentEventKind::Detection(snapshot) => snapshot.description(),
             RecentEventKind::NoteOn { midi_note } => {
@@ -312,6 +335,7 @@ pub struct AppState {
     pub engine_state: EngineState,
     pub worker_running: bool,
     pub midi_output_status: MidiOutputStatus,
+    pub template_status: TemplateStatus,
     pub selected_note: Option<u8>,
     pub active_note: Option<u8>,
     pub yin_result: Option<YinResult>,
@@ -336,6 +360,9 @@ impl Default for AppState {
 impl AppState {
     /// Create state from the loaded (or safe-default) application settings.
     pub fn new(config: AppConfig) -> Self {
+        let template_status = TemplateStatus::NotCalibrated {
+            path: config.template_path.clone(),
+        };
         Self {
             page: Page::Live,
             selected_audio_device: config.audio.device.clone(),
@@ -343,6 +370,7 @@ impl AppState {
             engine_state: EngineState::Stopped,
             worker_running: false,
             midi_output_status: MidiOutputStatus::NotInitialized,
+            template_status,
             selected_note: None,
             active_note: None,
             yin_result: None,
@@ -420,6 +448,21 @@ impl AppState {
                 self.set_error(ErrorKind::MidiOutput, message.clone());
                 self.push_event(
                     RecentEventKind::MidiOutputUnavailable { message },
+                    wall_clock_at,
+                );
+            }
+            EngineEvent::TemplateStatusChanged(status) => {
+                match &status {
+                    TemplateStatus::Error { message, .. } => {
+                        self.set_error(ErrorKind::Template, message.clone());
+                    }
+                    TemplateStatus::NotCalibrated { .. } | TemplateStatus::Loaded { .. } => {
+                        self.clear_error_of_kind(ErrorKind::Template);
+                    }
+                }
+                self.template_status = status.clone();
+                self.push_event(
+                    RecentEventKind::TemplateStatusChanged(status),
                     wall_clock_at,
                 );
             }
@@ -787,6 +830,58 @@ mod tests {
                 Some(EngineCommand::SetDetectorMode(mode))
             );
         }
+    }
+
+    #[test]
+    fn startup_always_enumerates_and_only_starts_when_saved_auto_start_is_enabled() {
+        let mut config = AppConfig::default();
+        assert_eq!(
+            startup_engine_commands(&config),
+            vec![EngineCommand::EnumerateAudioDevices]
+        );
+
+        config.auto_start = true;
+        assert_eq!(
+            startup_engine_commands(&config),
+            vec![EngineCommand::EnumerateAudioDevices, EngineCommand::Start]
+        );
+    }
+
+    #[test]
+    fn template_status_distinguishes_missing_loaded_and_invalid_without_blocking_yin() {
+        let path = PathBuf::from("/tmp/pss-f30-templates.json");
+        let mut state = AppState::default();
+        assert_eq!(
+            state.template_status,
+            TemplateStatus::NotCalibrated {
+                path: AppConfig::default().template_path
+            }
+        );
+
+        let missing = TemplateStatus::NotCalibrated { path: path.clone() };
+        state.reduce_event(EngineEvent::TemplateStatusChanged(missing.clone()), at(0));
+        assert_eq!(state.template_status, missing);
+        assert_eq!(state.config.detector_mode, DetectorMode::Yin);
+        assert_eq!(state.error_banner, None);
+
+        let invalid = TemplateStatus::Error {
+            path: path.clone(),
+            message: "invalid template JSON".to_owned(),
+        };
+        state.reduce_event(EngineEvent::TemplateStatusChanged(invalid.clone()), at(1));
+        assert_eq!(state.template_status, invalid);
+        assert_eq!(
+            state.error_banner,
+            Some(ErrorBanner {
+                kind: ErrorKind::Template,
+                message: "invalid template JSON".to_owned(),
+            })
+        );
+
+        let loaded = TemplateStatus::Loaded { path };
+        state.reduce_event(EngineEvent::TemplateStatusChanged(loaded.clone()), at(2));
+        assert_eq!(state.template_status, loaded);
+        assert_eq!(state.error_banner, None);
     }
 
     #[test]

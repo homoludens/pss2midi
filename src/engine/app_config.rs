@@ -11,7 +11,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::config::{default_template_path, DetectorMode};
+use crate::engine::config::{
+    default_template_path, AudioArgs, DetectorMode, RunArgs, SpectralArgs,
+};
 
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -123,6 +125,38 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// Map persisted desktop preferences to the engine's runtime arguments.
+    pub fn to_run_args(&self) -> RunArgs {
+        RunArgs {
+            audio: AudioArgs {
+                device: self.audio.device.clone(),
+                sample_rate: self.audio.sample_rate,
+                hop: self.advanced.hop_size,
+                onset_buffer: self.advanced.onset_buffer_size,
+                silence_db: self.advanced.silence_db,
+            },
+            detector: self.detector_mode,
+            pitch_buffer: self.advanced.pitch_buffer_size,
+            attack_ignore_ms: self.advanced.attack_ignore_ms,
+            decision_window_ms: self.advanced.decision_window_ms,
+            decision_extend_ms: self.advanced.decision_extend_ms,
+            release_ms: self.advanced.release_ms,
+            retrigger_ms: self.advanced.retrigger_ms,
+            onset_threshold: self.advanced.onset_threshold,
+            vote_ratio: self.advanced.vote_ratio,
+            initial_stable: self.advanced.initial_stable_frames,
+            templates: Some(self.template_path.clone()),
+            spectral: SpectralArgs {
+                spectral_delay_ms: self.spectral.delay_ms,
+                spectral_window_ms: self.spectral.window_ms,
+                fft_size: self.advanced.fft_size,
+                spectral_min_score: self.spectral.minimum_score,
+                spectral_min_margin: self.spectral.minimum_margin,
+            },
+            debug: false,
+        }
+    }
+
     /// Validate settings that are active for the selected detector mode.
     pub fn validate(&self) -> Result<(), ConfigValidationError> {
         let mut issues = Vec::new();
@@ -546,6 +580,81 @@ mod tests {
             }
         );
         assert!(!config.auto_start);
+    }
+
+    #[test]
+    fn runtime_mapping_carries_default_and_custom_audio_detector_spectral_and_template_settings() {
+        let defaults = AppConfig::default().to_run_args();
+        assert_eq!(defaults.audio.device, "pipewire");
+        assert_eq!(defaults.audio.sample_rate, 48_000);
+        assert_eq!(defaults.audio.hop, 128);
+        assert_eq!(defaults.audio.onset_buffer, 1024);
+        assert_eq!(defaults.audio.silence_db, -45.0);
+        assert_eq!(defaults.detector, DetectorMode::Yin);
+        assert_eq!(defaults.pitch_buffer, 2048);
+        assert_eq!(defaults.attack_ignore_ms, 10.0);
+        assert_eq!(defaults.decision_window_ms, 20.0);
+        assert_eq!(defaults.decision_extend_ms, 10.0);
+        assert_eq!(defaults.release_ms, 30.0);
+        assert_eq!(defaults.retrigger_ms, 60.0);
+        assert_eq!(defaults.onset_threshold, 0.30);
+        assert_eq!(defaults.vote_ratio, 0.60);
+        assert_eq!(defaults.initial_stable, 10);
+        assert_eq!(defaults.spectral.spectral_delay_ms, 8.0);
+        assert_eq!(defaults.spectral.spectral_window_ms, 30.0);
+        assert_eq!(defaults.spectral.fft_size, 2048);
+        assert_eq!(defaults.spectral.spectral_min_score, 0.75);
+        assert_eq!(defaults.spectral.spectral_min_margin, 0.03);
+        assert_eq!(defaults.templates, Some(AppConfig::default().template_path));
+
+        let mut config = AppConfig::default();
+        config.audio.device = "hw:4,0".to_owned();
+        config.audio.sample_rate = 44_100;
+        config.detector_mode = DetectorMode::Compare;
+        config.template_path = PathBuf::from("/tmp/custom-templates.json");
+        config.spectral.delay_ms = 12.5;
+        config.spectral.window_ms = 24.0;
+        config.spectral.minimum_score = 0.82;
+        config.spectral.minimum_margin = 0.07;
+        config.advanced.hop_size = 256;
+        config.advanced.onset_buffer_size = 2048;
+        config.advanced.silence_db = -38.0;
+        config.advanced.pitch_buffer_size = 4096;
+        config.advanced.attack_ignore_ms = 15.0;
+        config.advanced.decision_window_ms = 25.0;
+        config.advanced.decision_extend_ms = 5.0;
+        config.advanced.release_ms = 35.0;
+        config.advanced.retrigger_ms = 75.0;
+        config.advanced.onset_threshold = 0.42;
+        config.advanced.vote_ratio = 0.72;
+        config.advanced.initial_stable_frames = 12;
+        config.advanced.fft_size = 4096;
+
+        let args = config.to_run_args();
+        assert_eq!(args.audio.device, "hw:4,0");
+        assert_eq!(args.audio.sample_rate, 44_100);
+        assert_eq!(args.audio.hop, 256);
+        assert_eq!(args.audio.onset_buffer, 2048);
+        assert_eq!(args.audio.silence_db, -38.0);
+        assert_eq!(args.detector, DetectorMode::Compare);
+        assert_eq!(args.pitch_buffer, 4096);
+        assert_eq!(args.attack_ignore_ms, 15.0);
+        assert_eq!(args.decision_window_ms, 25.0);
+        assert_eq!(args.decision_extend_ms, 5.0);
+        assert_eq!(args.release_ms, 35.0);
+        assert_eq!(args.retrigger_ms, 75.0);
+        assert_eq!(args.onset_threshold, 0.42);
+        assert_eq!(args.vote_ratio, 0.72);
+        assert_eq!(args.initial_stable, 12);
+        assert_eq!(args.spectral.spectral_delay_ms, 12.5);
+        assert_eq!(args.spectral.spectral_window_ms, 24.0);
+        assert_eq!(args.spectral.spectral_min_score, 0.82);
+        assert_eq!(args.spectral.spectral_min_margin, 0.07);
+        assert_eq!(args.spectral.fft_size, 4096);
+        assert_eq!(
+            args.templates,
+            Some(PathBuf::from("/tmp/custom-templates.json"))
+        );
     }
 
     #[test]

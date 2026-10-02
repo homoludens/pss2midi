@@ -12,12 +12,13 @@ use pss2midi::{
         app_config::AppConfig,
         calibration::{CalibrationRejectionReason, CalibrationSampleQuality},
         config::DetectorMode,
+        load_config_or_default,
         note::note_name,
-        save_config, EngineCommand, EngineEvent, EngineState, PssEngine,
+        save_config, EngineCommand, EngineEvent, EngineState, PssEngine, TemplateStatus,
     },
     ui::state::{
-        engine_command_for_action, AppState, CalibrationStatus, ErrorKind, LiveControlAction,
-        MidiOutputStatus, Page,
+        engine_command_for_action, startup_engine_commands, AppState, CalibrationStatus, ErrorKind,
+        LiveControlAction, MidiOutputStatus, Page,
     },
 };
 
@@ -93,9 +94,12 @@ impl SettingsTextEdit {
 
 impl Pss2MidiApp {
     fn new(cx: &mut Context<Self>) -> Self {
+        let loaded_config = load_config_or_default();
+        let config = loaded_config.config;
+        let config_error = loaded_config.error.map(|error| error.to_string());
         let (settings_save_sender, settings_save_receiver) = async_channel::unbounded();
         let mut app = Self {
-            state: AppState::default(),
+            state: AppState::new(config.clone()),
             show_log: true,
             audio_device_menu_open: false,
             advanced_settings_expanded: ADVANCED_SETTINGS_EXPANDED_BY_DEFAULT,
@@ -109,6 +113,10 @@ impl Pss2MidiApp {
             event_task: None,
             engine: None,
         };
+        if let Some(message) = config_error {
+            app.state
+                .reduce_event(EngineEvent::Error { message }, Instant::now());
+        }
 
         app.settings_save_task = Some(cx.spawn(async move |this, cx| {
             while let Ok(mut request) = settings_save_receiver.recv().await {
@@ -146,7 +154,7 @@ impl Pss2MidiApp {
             }
         }));
 
-        match PssEngine::new() {
+        match PssEngine::new_with_config(config.clone()) {
             Ok(engine) => {
                 let event_rx = engine.event_receiver();
                 app.engine = Some(engine);
@@ -167,6 +175,21 @@ impl Pss2MidiApp {
                         }
                     }
                 }));
+                for command in startup_engine_commands(&config) {
+                    if app
+                        .engine
+                        .as_ref()
+                        .is_some_and(|engine| engine.send(command).is_err())
+                    {
+                        app.state.reduce_event(
+                            EngineEvent::Error {
+                                message: "The engine worker rejected a startup command".to_owned(),
+                            },
+                            Instant::now(),
+                        );
+                        break;
+                    }
+                }
             }
             Err(error) => app.state.reduce_event(
                 EngineEvent::Error {
@@ -790,6 +813,7 @@ impl Pss2MidiApp {
                 cx,
             ),
         ))
+        .child(template_status_summary(&self.state.template_status))
         .child(
             div()
                 .id("settings-recalibrate")
@@ -2256,7 +2280,8 @@ fn live_controls(
                             detector_mode,
                             cx,
                         )),
-                ),
+                )
+                .child(template_status_summary(&state.template_status)),
         );
 
     if let Some(error) = &state.error_banner {
@@ -2476,6 +2501,46 @@ fn midi_output_badge(status: &MidiOutputStatus) -> impl IntoElement {
                 .text_size(px(theme::FONT_CAPTION))
                 .text_color(rgb(theme::TEXT_SECONDARY))
                 .child(name.to_owned()),
+        )
+        .child(StatusBadge::new(label, tone).render())
+}
+
+fn template_status_summary(status: &TemplateStatus) -> impl IntoElement {
+    let (label, tone, detail) = match status {
+        TemplateStatus::NotCalibrated { path } => (
+            "NOT CALIBRATED",
+            StatusTone::Warning,
+            format!("Spectral detection needs calibration · {}", path.display()),
+        ),
+        TemplateStatus::Loaded { path } => (
+            "CALIBRATED",
+            StatusTone::Success,
+            format!("Loaded templates · {}", path.display()),
+        ),
+        TemplateStatus::Error { path, message } => (
+            "ERROR",
+            StatusTone::Error,
+            format!("{} · {message}", path.display()),
+        ),
+    };
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(theme::SPACE_SM))
+        .px(px(theme::SPACE_SM))
+        .py(px(theme::SPACE_XS))
+        .rounded_md()
+        .bg(rgb(theme::PANEL_INSET))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(px(theme::FONT_CAPTION))
+                .text_color(rgb(theme::TEXT_SECONDARY))
+                .child(detail),
         )
         .child(StatusBadge::new(label, tone).render())
 }
