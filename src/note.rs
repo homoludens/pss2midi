@@ -44,3 +44,16 @@ pub fn quantize_pitch(midi: f32) -> Option<(u8, f32)> {
     let cents = (midi - rounded as f32) * 100.0;
     (cents.abs() <= 45.0).then_some((rounded as u8, cents))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quantizer_keeps_pss_f30_range_c2_through_c5() {
+        assert_eq!(quantize_pitch(36.0).map(|(note, _)| note), Some(36));
+        assert_eq!(quantize_pitch(72.0).map(|(note, _)| note), Some(72));
+        assert_eq!(quantize_pitch(35.0), None);
+        assert_eq!(quantize_pitch(73.0), None);
+    }
+}

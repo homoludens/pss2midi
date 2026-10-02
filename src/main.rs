@@ -1,8 +1,12 @@
 mod audio;
+mod calibration;
 mod config;
 mod detector;
+mod features;
 mod midi;
 mod note;
+mod onset;
+mod templates;
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -12,15 +16,27 @@ use std::sync::{
 use anyhow::Result;
 use clap::Parser;
 
-use crate::{audio::open_capture, config::Args, detector::Detector, midi::Midi};
+use crate::{
+    audio::open_capture,
+    config::{Cli, Commands, DetectorMode, RunArgs},
+    detector::Detector,
+    midi::Midi,
+};
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let cli = Cli::parse();
+    if let Some(Commands::Calibrate(args)) = cli.command {
+        return calibration::run(args);
+    }
+    run(cli.run)
+}
+
+fn run(args: RunArgs) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     let signal_running = Arc::clone(&running);
     ctrlc::set_handler(move || signal_running.store(false, Ordering::SeqCst))?;
 
-    let (pcm, sample_rate, hop) = open_capture(&args)?;
+    let (pcm, sample_rate, hop) = open_capture(&args.audio)?;
     let (buffer_frames, period_frames) = pcm.get_params()?;
     print_startup(&args, sample_rate, hop, buffer_frames, period_frames);
 
@@ -57,7 +73,7 @@ fn main() -> Result<()> {
 }
 
 fn print_startup(
-    args: &Args,
+    args: &RunArgs,
     sample_rate: u32,
     hop: usize,
     buffer_frames: u64,
@@ -65,7 +81,8 @@ fn print_startup(
 ) {
     println!("PSS-F30 -> Rust/aubio -> MIDI");
     println!("--------------------------------");
-    println!("ALSA input       : {}", args.device);
+    println!("Detector         : {:?}", args.detector);
+    println!("ALSA input       : {}", args.audio.device);
     println!("Sample rate      : {sample_rate}");
     println!(
         "Hop / period     : {hop} samples ({:.2} ms)",
@@ -73,21 +90,35 @@ fn print_startup(
     );
     println!("ALSA buffer      : {buffer_frames} frames");
     println!("ALSA period      : {period_frames} frames");
-    println!(
-        "Pitch buffer     : {} samples ({:.2} ms)",
-        args.pitch_buffer,
-        args.pitch_buffer as f64 / sample_rate as f64 * 1000.0
-    );
+    if args.detector != DetectorMode::Spectral {
+        println!(
+            "YIN pitch buffer : {} samples ({:.2} ms)",
+            args.pitch_buffer,
+            args.pitch_buffer as f64 / sample_rate as f64 * 1000.0
+        );
+    }
     println!("Range            : C2-C5 / MIDI 36-72");
     println!("MIDI output      : PSS-F30 Audio MIDI\n");
 
-    if sample_rate != args.sample_rate {
-        eprintln!(
-            "Warning: requested {} Hz, ALSA selected {sample_rate} Hz",
-            args.sample_rate
+    if args.detector != DetectorMode::Yin {
+        println!(
+            "Spectral window : {:.1} ms delay + {:.1} ms samples (FFT {})",
+            args.spectral.spectral_delay_ms,
+            args.spectral.spectral_window_ms,
+            args.spectral.fft_size,
         );
     }
-    if hop != args.hop {
-        eprintln!("Warning: requested hop {}, ALSA selected {hop}", args.hop);
+
+    if sample_rate != args.audio.sample_rate {
+        eprintln!(
+            "Warning: requested {} Hz, ALSA selected {sample_rate} Hz",
+            args.audio.sample_rate
+        );
+    }
+    if hop != args.audio.hop {
+        eprintln!(
+            "Warning: requested hop {}, ALSA selected {hop}",
+            args.audio.hop
+        );
     }
 }
