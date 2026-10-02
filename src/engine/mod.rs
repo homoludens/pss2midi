@@ -22,6 +22,6 @@ pub use app_config::{
     load_config_or_default_from, save_config, save_config_to, AdvancedSettings, AppConfig,
     AudioSettings, ConfigError, ConfigLoadResult, ConfigValidationError, SpectralSettings,
 };
-pub use audio_device::AudioInputDevice;
+pub use audio_device::{AudioInputDevice, PIPEWIRE_DEFAULT_DEVICE_ID};
 pub use detector::{DetectorOutcome, NoteDecision, SpectralResult, YinDecision, YinResult};
 pub use worker::{EngineCommand, EngineEvent, EngineState, PssEngine};

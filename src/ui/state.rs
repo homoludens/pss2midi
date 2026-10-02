@@ -9,9 +9,10 @@ use std::{
 use crate::engine::{
     app_config::AppConfig,
     calibration::{CalibrationNoteCompletion, CalibrationProgress, CalibrationSampleQuality},
+    config::DetectorMode,
     detector::{SpectralResult, YinResult},
     note::note_name,
-    AudioInputDevice, EngineEvent, EngineState,
+    AudioInputDevice, EngineCommand, EngineEvent, EngineState,
 };
 
 /// Maximum number of high-level events retained for the recent-event panel.
@@ -38,7 +39,46 @@ pub enum ErrorKind {
     Runtime,
     AudioDevice,
     AudioDeviceEnumeration,
+    MidiOutput,
     Calibration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MidiOutputStatus {
+    NotInitialized,
+    Available { name: String },
+    Closed,
+    Error { message: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LiveControlAction {
+    ToggleEngine,
+    EnumerateAudioDevices,
+    SelectAudioDevice { device_id: String },
+    RetryAudioDevice,
+    SetDetectorMode(DetectorMode),
+}
+
+/// Map a UI action to an engine command without changing UI state. In
+/// particular, toggle behavior is based on the last engine-reported state.
+pub fn engine_command_for_action(
+    action: LiveControlAction,
+    engine_state: EngineState,
+) -> Option<EngineCommand> {
+    match action {
+        LiveControlAction::ToggleEngine => match engine_state {
+            EngineState::Stopped => Some(EngineCommand::Start),
+            EngineState::Running => Some(EngineCommand::Stop),
+            EngineState::ShuttingDown => None,
+        },
+        LiveControlAction::EnumerateAudioDevices => Some(EngineCommand::EnumerateAudioDevices),
+        LiveControlAction::SelectAudioDevice { device_id } => {
+            Some(EngineCommand::SetAudioDevice { device: device_id })
+        }
+        LiveControlAction::RetryAudioDevice => Some(EngineCommand::RetryAudioDevice),
+        LiveControlAction::SetDetectorMode(mode) => Some(EngineCommand::SetDetectorMode(mode)),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,6 +165,14 @@ pub enum RecentEventKind {
     WorkerStarted,
     WorkerStopped,
     EngineStateChanged(EngineState),
+    DetectorModeChanged(DetectorMode),
+    MidiOutputOpened {
+        name: String,
+    },
+    MidiOutputClosed,
+    MidiOutputUnavailable {
+        message: String,
+    },
     Onset,
     Detection(DetectionSnapshot),
     NoteOn {
@@ -188,6 +236,16 @@ impl RecentEvent {
             RecentEventKind::EngineStateChanged(state) => {
                 format!("Engine {}", engine_state_label(*state))
             }
+            RecentEventKind::DetectorModeChanged(mode) => {
+                format!("Detector mode changed to {}", detector_mode_label(*mode))
+            }
+            RecentEventKind::MidiOutputOpened { name } => {
+                format!("MIDI output connected: {name}")
+            }
+            RecentEventKind::MidiOutputClosed => "MIDI output closed".to_owned(),
+            RecentEventKind::MidiOutputUnavailable { message } => {
+                format!("MIDI output unavailable: {message}")
+            }
             RecentEventKind::Onset => "Onset detected".to_owned(),
             RecentEventKind::Detection(snapshot) => snapshot.description(),
             RecentEventKind::NoteOn { midi_note } => {
@@ -249,6 +307,7 @@ pub struct AppState {
     pub config: AppConfig,
     pub engine_state: EngineState,
     pub worker_running: bool,
+    pub midi_output_status: MidiOutputStatus,
     pub selected_note: Option<u8>,
     pub active_note: Option<u8>,
     pub yin_result: Option<YinResult>,
@@ -279,6 +338,7 @@ impl AppState {
             config,
             engine_state: EngineState::Stopped,
             worker_running: false,
+            midi_output_status: MidiOutputStatus::NotInitialized,
             selected_note: None,
             active_note: None,
             yin_result: None,
@@ -332,8 +392,32 @@ impl AppState {
                 self.engine_state = state;
                 if matches!(state, EngineState::Stopped | EngineState::ShuttingDown) {
                     self.clear_active_note();
+                    self.audio_device_open = false;
                 }
                 self.push_event(RecentEventKind::EngineStateChanged(state), wall_clock_at);
+            }
+            EngineEvent::DetectorModeChanged(mode) => {
+                self.config.detector_mode = mode;
+                self.push_event(RecentEventKind::DetectorModeChanged(mode), wall_clock_at);
+            }
+            EngineEvent::MidiOutputOpened { name } => {
+                self.midi_output_status = MidiOutputStatus::Available { name: name.clone() };
+                self.clear_error_of_kind(ErrorKind::MidiOutput);
+                self.push_event(RecentEventKind::MidiOutputOpened { name }, wall_clock_at);
+            }
+            EngineEvent::MidiOutputClosed => {
+                self.midi_output_status = MidiOutputStatus::Closed;
+                self.push_event(RecentEventKind::MidiOutputClosed, wall_clock_at);
+            }
+            EngineEvent::MidiOutputUnavailable { message } => {
+                self.midi_output_status = MidiOutputStatus::Error {
+                    message: message.clone(),
+                };
+                self.set_error(ErrorKind::MidiOutput, message.clone());
+                self.push_event(
+                    RecentEventKind::MidiOutputUnavailable { message },
+                    wall_clock_at,
+                );
             }
             EngineEvent::Onset => self.push_event(RecentEventKind::Onset, wall_clock_at),
             EngineEvent::Detection {
@@ -549,6 +633,14 @@ fn engine_state_label(state: EngineState) -> &'static str {
     }
 }
 
+fn detector_mode_label(mode: DetectorMode) -> &'static str {
+    match mode {
+        DetectorMode::Yin => "YIN",
+        DetectorMode::Spectral => "Spectral",
+        DetectorMode::Compare => "Compare",
+    }
+}
+
 fn calibration_quality_label(quality: &CalibrationSampleQuality) -> &'static str {
     match quality {
         CalibrationSampleQuality::AwaitingOnset => "waiting for onset",
@@ -629,6 +721,108 @@ mod tests {
             state.select_page(page);
             assert_eq!(state.page, page);
         }
+    }
+
+    #[test]
+    fn live_control_actions_map_to_engine_commands_from_reported_state() {
+        assert_eq!(
+            engine_command_for_action(LiveControlAction::ToggleEngine, EngineState::Stopped),
+            Some(EngineCommand::Start)
+        );
+        assert_eq!(
+            engine_command_for_action(LiveControlAction::ToggleEngine, EngineState::Running),
+            Some(EngineCommand::Stop)
+        );
+        assert_eq!(
+            engine_command_for_action(LiveControlAction::ToggleEngine, EngineState::ShuttingDown),
+            None
+        );
+        assert_eq!(
+            engine_command_for_action(
+                LiveControlAction::EnumerateAudioDevices,
+                EngineState::Stopped
+            ),
+            Some(EngineCommand::EnumerateAudioDevices)
+        );
+        assert_eq!(
+            engine_command_for_action(
+                LiveControlAction::SelectAudioDevice {
+                    device_id: "hw:2,0".to_owned(),
+                },
+                EngineState::Running
+            ),
+            Some(EngineCommand::SetAudioDevice {
+                device: "hw:2,0".to_owned(),
+            })
+        );
+        assert_eq!(
+            engine_command_for_action(LiveControlAction::RetryAudioDevice, EngineState::Stopped),
+            Some(EngineCommand::RetryAudioDevice)
+        );
+        for mode in [
+            DetectorMode::Yin,
+            DetectorMode::Spectral,
+            DetectorMode::Compare,
+        ] {
+            assert_eq!(
+                engine_command_for_action(
+                    LiveControlAction::SetDetectorMode(mode),
+                    EngineState::Stopped
+                ),
+                Some(EngineCommand::SetDetectorMode(mode))
+            );
+        }
+    }
+
+    #[test]
+    fn midi_and_mode_controls_follow_engine_events_instead_of_assuming_success() {
+        let mut state = AppState::default();
+        assert_eq!(state.midi_output_status, MidiOutputStatus::NotInitialized);
+
+        state.reduce_event(EngineEvent::StateChanged(EngineState::Running), at(0));
+        assert_eq!(state.midi_output_status, MidiOutputStatus::NotInitialized);
+
+        state.reduce_event(
+            EngineEvent::MidiOutputOpened {
+                name: "PSS-F30 Audio MIDI".to_owned(),
+            },
+            at(1),
+        );
+        assert_eq!(
+            state.midi_output_status,
+            MidiOutputStatus::Available {
+                name: "PSS-F30 Audio MIDI".to_owned(),
+            }
+        );
+
+        state.reduce_event(
+            EngineEvent::DetectorModeChanged(DetectorMode::Compare),
+            at(2),
+        );
+        assert_eq!(state.config.detector_mode, DetectorMode::Compare);
+
+        state.reduce_event(
+            EngineEvent::MidiOutputUnavailable {
+                message: "MIDI backend unavailable".to_owned(),
+            },
+            at(3),
+        );
+        assert_eq!(
+            state.midi_output_status,
+            MidiOutputStatus::Error {
+                message: "MIDI backend unavailable".to_owned(),
+            }
+        );
+        assert_eq!(
+            state.error_banner,
+            Some(ErrorBanner {
+                kind: ErrorKind::MidiOutput,
+                message: "MIDI backend unavailable".to_owned(),
+            })
+        );
+
+        state.reduce_event(EngineEvent::MidiOutputClosed, at(4));
+        assert_eq!(state.midi_output_status, MidiOutputStatus::Closed);
     }
 
     #[test]

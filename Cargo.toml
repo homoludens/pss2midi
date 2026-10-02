@@ -6,6 +6,7 @@ description = "Low-latency Yamaha PSS-F30 audio to MIDI converter"
 license = "GPL-3.0-only"
 
 [dependencies]
+async-channel = "2"
 alsa = "0.11"
 anyhow = "1"
 aubio = { version = "0.2.1", default-features = false, features = ["pkg-config"] }

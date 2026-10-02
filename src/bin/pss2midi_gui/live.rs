@@ -7,8 +7,9 @@ use pss2midi::{
         config::DetectorMode,
         detector::{RankedMatch, SpectralResult, YinResult},
         note::note_name,
+        AudioInputDevice, PIPEWIRE_DEFAULT_DEVICE_ID,
     },
-    ui::state::{AppState, AudioLevels},
+    ui::state::{AppState, AudioLevels, LiveControlAction},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,6 +25,47 @@ impl NoteReading {
             name: note_name(midi_note),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AudioDeviceChoice {
+    pub(super) id: String,
+    pub(super) label: String,
+    pub(super) selected: bool,
+}
+
+impl AudioDeviceChoice {
+    pub(super) fn selection_action(&self) -> LiveControlAction {
+        LiveControlAction::SelectAudioDevice {
+            device_id: self.id.clone(),
+        }
+    }
+}
+
+/// Project enumerated devices into selector choices. PipeWire remains a UI
+/// fallback choice when ALSA does not list its default alias; the engine's
+/// enumeration data is never modified or augmented here.
+pub(super) fn audio_device_choices(
+    devices: &[AudioInputDevice],
+    selected_device: &str,
+) -> Vec<AudioDeviceChoice> {
+    let mut choices = Vec::with_capacity(devices.len() + 1);
+    if !devices
+        .iter()
+        .any(|device| device.id == PIPEWIRE_DEFAULT_DEVICE_ID)
+    {
+        choices.push(AudioDeviceChoice {
+            id: PIPEWIRE_DEFAULT_DEVICE_ID.to_owned(),
+            label: "PipeWire default".to_owned(),
+            selected: selected_device == PIPEWIRE_DEFAULT_DEVICE_ID,
+        });
+    }
+    choices.extend(devices.iter().map(|device| AudioDeviceChoice {
+        id: device.id.clone(),
+        label: device.label.clone(),
+        selected: device.id == selected_device,
+    }));
+    choices
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,12 +139,59 @@ mod tests {
             config::DetectorMode,
             detector::{RankedMatch, SpectralResult, YinDecision, YinResult},
             templates::RankedMatch as TemplateRankedMatch,
-            EngineEvent,
+            AudioInputDevice, EngineCommand, EngineEvent, PIPEWIRE_DEFAULT_DEVICE_ID,
         },
-        ui::state::{AppState, AudioLevels},
+        ui::state::{engine_command_for_action, AppState, AudioLevels, LiveControlAction},
     };
 
-    use super::{DetectorAgreement, LiveViewModel, NoteReading};
+    use super::{
+        audio_device_choices, AudioDeviceChoice, DetectorAgreement, LiveViewModel, NoteReading,
+    };
+
+    #[test]
+    fn audio_dropdown_includes_pipewire_without_mutating_enumeration_and_maps_selection() {
+        let enumerated_devices = vec![AudioInputDevice {
+            id: "hw:1,0".to_owned(),
+            label: "USB keyboard input".to_owned(),
+        }];
+        let choices = audio_device_choices(&enumerated_devices, "pipewire");
+
+        assert_eq!(
+            choices,
+            vec![
+                AudioDeviceChoice {
+                    id: PIPEWIRE_DEFAULT_DEVICE_ID.to_owned(),
+                    label: "PipeWire default".to_owned(),
+                    selected: true,
+                },
+                AudioDeviceChoice {
+                    id: "hw:1,0".to_owned(),
+                    label: "USB keyboard input".to_owned(),
+                    selected: false,
+                },
+            ]
+        );
+        assert_eq!(enumerated_devices.len(), 1);
+
+        let action = choices[1].selection_action();
+        assert_eq!(
+            action,
+            LiveControlAction::SelectAudioDevice {
+                device_id: "hw:1,0".to_owned(),
+            }
+        );
+        assert_eq!(
+            engine_command_for_action(action, pss2midi::engine::EngineState::Stopped),
+            Some(EngineCommand::SetAudioDevice {
+                device: "hw:1,0".to_owned(),
+            })
+        );
+
+        let empty_choices = audio_device_choices(&[], PIPEWIRE_DEFAULT_DEVICE_ID);
+        assert_eq!(empty_choices.len(), 1);
+        assert_eq!(empty_choices[0].label, "PipeWire default");
+        assert!(empty_choices[0].selected);
+    }
 
     #[test]
     fn empty_state_projects_unavailable_values_without_inventing_results() {

@@ -1,19 +1,21 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    div, prelude::*, px, rgb, size, App, Context, FontWeight, Render, Window, WindowBounds,
+    div, prelude::*, px, rgb, size, App, Context, FontWeight, Render, Task, Window, WindowBounds,
     WindowOptions,
 };
 use pss2midi::{
-    engine::note::note_name,
-    ui::state::{AppState, Page},
+    engine::{config::DetectorMode, note::note_name, EngineEvent, EngineState, PssEngine},
+    ui::state::{
+        engine_command_for_action, AppState, ErrorKind, LiveControlAction, MidiOutputStatus, Page,
+    },
 };
 
 use crate::{
     components::{
         DetectorCard, EventLog, LevelMeter, ScoreMeter, SpectralMatchRow, StatusBadge, StatusTone,
     },
-    live::{DetectorAgreement, LiveViewModel},
+    live::{audio_device_choices, AudioDeviceChoice, DetectorAgreement, LiveViewModel},
     piano::PianoKeyboard,
     theme,
 };
@@ -25,13 +27,65 @@ pub(super) const MINIMUM_WINDOW_SIZE: (f32, f32) = (850.0, 600.0);
 struct Pss2MidiApp {
     state: AppState,
     show_log: bool,
+    audio_device_menu_open: bool,
+    event_task: Option<Task<()>>,
+    engine: Option<PssEngine>,
 }
 
-impl Default for Pss2MidiApp {
-    fn default() -> Self {
-        Self {
+impl Pss2MidiApp {
+    fn new(cx: &mut Context<Self>) -> Self {
+        let mut app = Self {
             state: AppState::default(),
             show_log: true,
+            audio_device_menu_open: false,
+            event_task: None,
+            engine: None,
+        };
+
+        match PssEngine::new() {
+            Ok(engine) => {
+                let event_rx = engine.event_receiver();
+                app.engine = Some(engine);
+                app.event_task = Some(cx.spawn(async move |this, cx| {
+                    while let Ok(event) = event_rx.recv().await {
+                        if this
+                            .update(cx, |this, cx| {
+                                this.state.reduce_event(event, Instant::now());
+                                cx.notify();
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }));
+            }
+            Err(error) => app.state.reduce_event(
+                EngineEvent::Error {
+                    message: format!("Could not start the engine worker: {error}"),
+                },
+                Instant::now(),
+            ),
+        }
+
+        app
+    }
+
+    fn dispatch_control_action(&mut self, action: LiveControlAction, cx: &mut Context<Self>) {
+        let Some(command) = engine_command_for_action(action, self.state.engine_state) else {
+            return;
+        };
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        if engine.send(command).is_err() {
+            self.state.reduce_event(
+                EngineEvent::Error {
+                    message: "The engine worker is no longer accepting commands".to_owned(),
+                },
+                Instant::now(),
+            );
+            cx.notify();
         }
     }
 }
@@ -44,7 +98,7 @@ impl Render for Pss2MidiApp {
             .flex_col()
             .bg(rgb(theme::WINDOW))
             .text_color(rgb(theme::TEXT_PRIMARY))
-            .child(top_bar())
+            .child(top_bar(&self.state, cx))
             .child(
                 div()
                     .flex()
@@ -273,6 +327,7 @@ impl Pss2MidiApp {
                     .flex_col()
                     .gap(px(theme::SPACE_MD))
                     .pb(px(theme::SPACE_MD))
+                    .child(live_controls(&self.state, self.audio_device_menu_open, cx))
                     .child(
                         div()
                             .w_full()
@@ -731,7 +786,453 @@ fn format_latency(latency: Duration) -> String {
     format!("{:.2} ms", latency.as_secs_f64() * 1_000.0)
 }
 
-fn top_bar() -> impl IntoElement {
+fn live_controls(
+    state: &AppState,
+    audio_device_menu_open: bool,
+    cx: &mut Context<Pss2MidiApp>,
+) -> impl IntoElement {
+    let choices = audio_device_choices(&state.audio_devices, &state.selected_audio_device);
+    let selected_label = choices
+        .iter()
+        .find(|choice| choice.selected)
+        .map(|choice| choice.label.clone())
+        .unwrap_or_else(|| state.selected_audio_device.clone());
+    let (audio_status, audio_tone) = if state.audio_device_open {
+        ("OPEN", StatusTone::Success)
+    } else if state.error_banner.as_ref().is_some_and(|error| {
+        matches!(
+            error.kind,
+            ErrorKind::AudioDevice | ErrorKind::AudioDeviceEnumeration
+        )
+    }) {
+        ("ERROR", StatusTone::Error)
+    } else {
+        ("NOT OPEN", StatusTone::Neutral)
+    };
+
+    let mut device_selector = div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(theme::SPACE_XS))
+        .child(
+            div()
+                .id("audio-device-selector-toggle")
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(theme::SPACE_SM))
+                .px(px(theme::SPACE_SM))
+                .py(px(theme::SPACE_SM))
+                .rounded_md()
+                .bg(rgb(theme::PANEL_INSET))
+                .border_1()
+                .border_color(rgb(theme::BORDER))
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.audio_device_menu_open = !this.audio_device_menu_open;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(theme::FONT_SMALL))
+                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .child(format!(
+                            "{selected_label} · {}",
+                            state.selected_audio_device
+                        )),
+                )
+                .child(
+                    div()
+                        .text_size(px(theme::FONT_CAPTION))
+                        .text_color(rgb(theme::TEXT_SECONDARY))
+                        .child(if audio_device_menu_open { "▲" } else { "▼" }),
+                ),
+        );
+
+    if audio_device_menu_open {
+        let mut menu = div()
+            .id("audio-device-selector-menu")
+            .w_full()
+            .h(px(150.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(theme::SPACE_XS))
+            .p(px(theme::SPACE_XS))
+            .rounded_md()
+            .bg(rgb(theme::PANEL_INSET))
+            .border_1()
+            .border_color(rgb(theme::BORDER));
+        if state.audio_devices.is_empty() {
+            menu = menu.child(
+                div()
+                    .px(px(theme::SPACE_XS))
+                    .py(px(theme::SPACE_XS))
+                    .text_size(px(theme::FONT_CAPTION))
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child("No ALSA inputs listed · Refresh to retry; PipeWire default remains selectable"),
+            );
+        }
+        menu = menu.children(choices.iter().map(|choice| audio_device_choice(choice, cx)));
+        device_selector = device_selector.child(menu);
+    }
+
+    let mut panel = div()
+        .w_full()
+        .flex()
+        .items_stretch()
+        .gap(px(theme::SPACE_SM))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(theme::SPACE_SM))
+                .p(px(theme::SPACE_MD))
+                .rounded_md()
+                .bg(rgb(theme::PANEL))
+                .border_1()
+                .border_color(rgb(theme::BORDER))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(theme::SPACE_SM))
+                        .child(control_heading("AUDIO INPUT"))
+                        .child(StatusBadge::new(audio_status, audio_tone).render()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(theme::SPACE_SM))
+                        .child(device_selector)
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .gap(px(theme::SPACE_XS))
+                                .child(action_button(
+                                    "audio-refresh-devices",
+                                    "Refresh",
+                                    LiveControlAction::EnumerateAudioDevices,
+                                    false,
+                                    cx,
+                                ))
+                                .child(action_button(
+                                    "audio-retry-device",
+                                    "Retry input",
+                                    LiveControlAction::RetryAudioDevice,
+                                    false,
+                                    cx,
+                                )),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .w(px(245.0))
+                .flex_none()
+                .flex()
+                .flex_col()
+                .gap(px(theme::SPACE_SM))
+                .p(px(theme::SPACE_MD))
+                .rounded_md()
+                .bg(rgb(theme::PANEL))
+                .border_1()
+                .border_color(rgb(theme::BORDER))
+                .child(control_heading("DETECTOR MODE"))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(theme::SPACE_XS))
+                        .child(detector_mode_choice(
+                            DetectorMode::Yin,
+                            state.config.detector_mode,
+                            cx,
+                        ))
+                        .child(detector_mode_choice(
+                            DetectorMode::Spectral,
+                            state.config.detector_mode,
+                            cx,
+                        ))
+                        .child(detector_mode_choice(
+                            DetectorMode::Compare,
+                            state.config.detector_mode,
+                            cx,
+                        )),
+                ),
+        );
+
+    if let Some(error) = &state.error_banner {
+        panel = panel.child(error_banner_panel(error, cx));
+    }
+
+    panel
+}
+
+fn control_heading(label: &'static str) -> impl IntoElement {
+    div()
+        .text_size(px(theme::FONT_CAPTION))
+        .text_color(rgb(theme::TEXT_MUTED))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(label)
+}
+
+fn action_button(
+    id: &'static str,
+    label: &'static str,
+    action: LiveControlAction,
+    primary: bool,
+    cx: &mut Context<Pss2MidiApp>,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex_none()
+        .px(px(theme::SPACE_SM))
+        .py(px(theme::SPACE_XS))
+        .rounded_md()
+        .bg(rgb(if primary {
+            theme::ACCENT_TINT
+        } else {
+            theme::PANEL_INSET
+        }))
+        .border_1()
+        .border_color(rgb(if primary {
+            theme::ACCENT
+        } else {
+            theme::BORDER
+        }))
+        .text_size(px(theme::FONT_CAPTION))
+        .text_color(rgb(if primary {
+            theme::ACCENT
+        } else {
+            theme::TEXT_SECONDARY
+        }))
+        .font_weight(FontWeight::SEMIBOLD)
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.dispatch_control_action(action.clone(), cx);
+        }))
+        .child(label)
+}
+
+fn detector_mode_choice(
+    mode: DetectorMode,
+    selected_mode: DetectorMode,
+    cx: &mut Context<Pss2MidiApp>,
+) -> impl IntoElement {
+    let (id, label) = match mode {
+        DetectorMode::Yin => ("detector-mode-yin", "YIN"),
+        DetectorMode::Spectral => ("detector-mode-spectral", "Spectral"),
+        DetectorMode::Compare => ("detector-mode-compare", "Compare"),
+    };
+    let selected = mode == selected_mode;
+    div()
+        .id(id)
+        .px(px(theme::SPACE_SM))
+        .py(px(theme::SPACE_SM))
+        .rounded_md()
+        .bg(rgb(if selected {
+            theme::ACCENT_TINT
+        } else {
+            theme::PANEL_INSET
+        }))
+        .border_1()
+        .border_color(rgb(if selected {
+            theme::ACCENT
+        } else {
+            theme::BORDER
+        }))
+        .text_size(px(theme::FONT_CAPTION))
+        .text_color(rgb(if selected {
+            theme::ACCENT
+        } else {
+            theme::TEXT_SECONDARY
+        }))
+        .font_weight(if selected {
+            FontWeight::SEMIBOLD
+        } else {
+            FontWeight::NORMAL
+        })
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.dispatch_control_action(LiveControlAction::SetDetectorMode(mode), cx);
+        }))
+        .child(label)
+}
+
+fn audio_device_choice(
+    choice: &AudioDeviceChoice,
+    cx: &mut Context<Pss2MidiApp>,
+) -> impl IntoElement {
+    let selected = choice.selected;
+    let choice_id = choice.id.clone();
+    let action = choice.selection_action();
+    div()
+        .id(choice_id.clone())
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(theme::SPACE_SM))
+        .px(px(theme::SPACE_SM))
+        .py(px(theme::SPACE_XS))
+        .rounded_md()
+        .bg(rgb(if selected {
+            theme::ACCENT_TINT
+        } else {
+            theme::PANEL_INSET
+        }))
+        .border_1()
+        .border_color(rgb(if selected {
+            theme::ACCENT
+        } else {
+            theme::BORDER
+        }))
+        .text_size(px(theme::FONT_CAPTION))
+        .text_color(rgb(if selected {
+            theme::ACCENT
+        } else {
+            theme::TEXT_SECONDARY
+        }))
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.audio_device_menu_open = false;
+            this.dispatch_control_action(action.clone(), cx);
+            cx.notify();
+        }))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(px(theme::FONT_CAPTION))
+                .text_color(rgb(if selected {
+                    theme::ACCENT
+                } else {
+                    theme::TEXT_SECONDARY
+                }))
+                .child(format!("{} · {}", choice.label, choice.id)),
+        )
+        .when(selected, |row| {
+            row.child(StatusBadge::new("SELECTED", StatusTone::Accent).render())
+        })
+}
+
+fn error_banner_panel(
+    error: &pss2midi::ui::state::ErrorBanner,
+    cx: &mut Context<Pss2MidiApp>,
+) -> impl IntoElement {
+    let can_retry_audio = matches!(
+        error.kind,
+        ErrorKind::AudioDevice | ErrorKind::AudioDeviceEnumeration
+    );
+    let mut panel = div()
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(theme::SPACE_SM))
+        .px(px(theme::SPACE_MD))
+        .py(px(theme::SPACE_SM))
+        .rounded_md()
+        .bg(rgb(theme::ERROR_TINT))
+        .border_1()
+        .border_color(rgb(theme::ERROR))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(px(theme::FONT_SMALL))
+                .text_color(rgb(theme::ERROR))
+                .child(error.message.clone()),
+        );
+    if can_retry_audio {
+        panel = panel.child(action_button(
+            "audio-error-retry",
+            "Retry",
+            LiveControlAction::RetryAudioDevice,
+            false,
+            cx,
+        ));
+    }
+    panel
+}
+
+fn midi_output_badge(status: &MidiOutputStatus) -> impl IntoElement {
+    let (name, label, tone) = match status {
+        MidiOutputStatus::NotInitialized => {
+            ("PSS-F30 Audio MIDI", "NOT STARTED", StatusTone::Neutral)
+        }
+        MidiOutputStatus::Available { name } => (name.as_str(), "CONNECTED", StatusTone::Success),
+        MidiOutputStatus::Closed => ("PSS-F30 Audio MIDI", "STOPPED", StatusTone::Neutral),
+        MidiOutputStatus::Error { .. } => ("PSS-F30 Audio MIDI", "ERROR", StatusTone::Error),
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap(px(theme::SPACE_XS))
+        .px(px(theme::SPACE_SM))
+        .py(px(theme::SPACE_XS))
+        .rounded_md()
+        .bg(rgb(theme::PANEL_INSET))
+        .child(
+            div()
+                .text_size(px(theme::FONT_CAPTION))
+                .text_color(rgb(theme::TEXT_SECONDARY))
+                .child(name.to_owned()),
+        )
+        .child(StatusBadge::new(label, tone).render())
+}
+
+fn top_bar(state: &AppState, cx: &mut Context<Pss2MidiApp>) -> impl IntoElement {
+    let (control_label, control_tone) = match state.engine_state {
+        EngineState::Stopped => ("Start", StatusTone::Success),
+        EngineState::Running => ("Stop", StatusTone::Warning),
+        EngineState::ShuttingDown => ("Closing…", StatusTone::Neutral),
+    };
+    let mut control = div()
+        .id("engine-start-stop")
+        .flex_none()
+        .px(px(theme::SPACE_MD))
+        .py(px(theme::SPACE_SM))
+        .rounded_md()
+        .bg(rgb(match control_tone {
+            StatusTone::Success => theme::SUCCESS_TINT,
+            StatusTone::Warning => theme::WARNING_TINT,
+            _ => theme::PANEL_INSET,
+        }))
+        .border_1()
+        .border_color(rgb(match control_tone {
+            StatusTone::Success => theme::SUCCESS,
+            StatusTone::Warning => theme::WARNING,
+            _ => theme::BORDER,
+        }))
+        .text_size(px(theme::FONT_SMALL))
+        .text_color(rgb(match control_tone {
+            StatusTone::Success => theme::SUCCESS,
+            StatusTone::Warning => theme::WARNING,
+            _ => theme::TEXT_MUTED,
+        }))
+        .font_weight(FontWeight::SEMIBOLD);
+    if state.engine_state != EngineState::ShuttingDown {
+        control = control
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.dispatch_control_action(LiveControlAction::ToggleEngine, cx);
+            }));
+    }
+    control = control.child(control_label);
+
     div()
         .h(px(theme::TOP_BAR_HEIGHT))
         .w_full()
@@ -785,18 +1286,8 @@ fn top_bar() -> impl IntoElement {
                 .flex()
                 .items_center()
                 .gap(px(theme::SPACE_SM))
-                .px(px(theme::SPACE_MD))
-                .py(px(theme::SPACE_SM))
-                .rounded_md()
-                .bg(rgb(theme::PANEL_INSET))
-                .child(div().size(px(7.0)).rounded_full().bg(rgb(theme::ACCENT)))
-                .child(
-                    div()
-                        .text_size(px(theme::FONT_CAPTION))
-                        .text_color(rgb(theme::TEXT_SECONDARY))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("DESKTOP APP"),
-                ),
+                .child(midi_output_badge(&state.midi_output_status))
+                .child(control),
         )
 }
 
@@ -815,7 +1306,7 @@ pub(super) fn launch(cx: &mut App) {
     let options = window_options(cx);
     cx.open_window(options, |window, cx| {
         window.set_window_title(APP_WINDOW_TITLE);
-        cx.new(|_| Pss2MidiApp::default())
+        cx.new(Pss2MidiApp::new)
     })
     .expect("failed to open GPUI window");
 }

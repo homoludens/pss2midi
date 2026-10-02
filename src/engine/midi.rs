@@ -3,6 +3,8 @@ use midir::{os::unix::VirtualOutput, MidiOutput, MidiOutputConnection};
 
 use crate::engine::note::note_name;
 
+pub const OUTPUT_NAME: &str = "PSS-F30 Audio MIDI";
+
 pub struct Midi {
     conn: MidiOutputConnection,
 }
@@ -11,7 +13,7 @@ impl Midi {
     pub fn new() -> Result<Self> {
         let output = MidiOutput::new("pss2midi").context("Cannot create MIDI client")?;
         let conn = output
-            .create_virtual("PSS-F30 Audio MIDI")
+            .create_virtual(OUTPUT_NAME)
             .map_err(|error| anyhow::anyhow!("Cannot create virtual MIDI output: {error}"))?;
         Ok(Self { conn })
     }

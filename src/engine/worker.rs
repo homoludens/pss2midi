@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
 use clap::Parser;
 
 use crate::engine::{
@@ -22,7 +23,7 @@ use crate::engine::{
     },
     config::{default_template_path, Cli, DetectorMode, RunArgs},
     detector::{Detector, DetectorOutcome, NoteDecision, SpectralResult, YinResult},
-    midi::Midi,
+    midi::{Midi, OUTPUT_NAME as MIDI_OUTPUT_NAME},
     note::rms_db,
     persistence::TemplatePersistenceTask,
 };
@@ -62,6 +63,14 @@ pub enum EngineEvent {
     WorkerStarted,
     WorkerStopped,
     StateChanged(EngineState),
+    DetectorModeChanged(DetectorMode),
+    MidiOutputOpened {
+        name: String,
+    },
+    MidiOutputClosed,
+    MidiOutputUnavailable {
+        message: String,
+    },
     Onset,
     Detection {
         selected_note: Option<u8>,
@@ -116,7 +125,7 @@ pub enum EngineEvent {
 /// leave that worker; callers exchange commands and events through channels.
 pub struct PssEngine {
     command_tx: Sender<EngineCommand>,
-    event_rx: Receiver<EngineEvent>,
+    event_rx: AsyncReceiver<EngineEvent>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -161,12 +170,21 @@ impl PssEngine {
 
     /// Wait for the next high-level worker event.
     pub fn recv_event(&self) -> Result<EngineEvent, RecvError> {
-        self.event_rx.recv()
+        self.event_rx.recv_blocking().map_err(|_| RecvError)
     }
 
     /// Check for a worker event without blocking.
     pub fn try_recv_event(&self) -> Result<EngineEvent, TryRecvError> {
-        self.event_rx.try_recv()
+        self.event_rx.try_recv().map_err(|error| match error {
+            async_channel::TryRecvError::Empty => TryRecvError::Empty,
+            async_channel::TryRecvError::Closed => TryRecvError::Disconnected,
+        })
+    }
+
+    /// Clone the event receiver for asynchronous consumers such as a UI task.
+    /// The existing blocking receive methods remain available to non-UI clients.
+    pub fn event_receiver(&self) -> AsyncReceiver<EngineEvent> {
+        self.event_rx.clone()
     }
 
     /// Ask the worker to stop and join it. Repeated calls are harmless.
@@ -190,12 +208,12 @@ impl PssEngine {
         R: WorkerRuntime,
     {
         let (command_tx, command_rx) = mpsc::channel();
-        let (event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = async_channel::unbounded();
         let worker = thread::Builder::new()
             .name("pss2midi-engine".to_owned())
             .spawn(move || {
                 let runtime = runtime_factory();
-                run_worker(command_rx, event_tx, runtime, settings);
+                run_worker(command_rx, EngineEventSender(event_tx), runtime, settings);
             })?;
 
         Ok(Self {
@@ -203,6 +221,17 @@ impl PssEngine {
             event_rx,
             worker: Some(worker),
         })
+    }
+}
+
+/// Synchronous, nonblocking publication into the unbounded async event queue.
+/// `send` only enqueues; it never waits for the UI or another event consumer.
+#[derive(Clone)]
+struct EngineEventSender(AsyncSender<EngineEvent>);
+
+impl EngineEventSender {
+    fn send(&self, event: EngineEvent) -> Result<(), ()> {
+        self.0.try_send(event).map_err(|_| ())
     }
 }
 
@@ -243,6 +272,7 @@ impl WorkerSettings {
 #[derive(Debug)]
 enum RuntimeFailure {
     AudioDevice(AudioDeviceUnavailable),
+    MidiOutput(String),
     Calibration(String),
     Other(String),
 }
@@ -298,7 +328,7 @@ struct CaptureStepStatus {
 
 fn run_worker<R>(
     command_rx: Receiver<EngineCommand>,
-    event_tx: Sender<EngineEvent>,
+    event_tx: EngineEventSender,
     mut runtime: R,
     mut settings: WorkerSettings,
 ) where
@@ -393,6 +423,7 @@ fn run_worker<R>(
                     next_settings,
                     running,
                 );
+                let _ = event_tx.send(EngineEvent::DetectorModeChanged(settings.mode));
             }
             EngineCommand::SetDetectorMode(_) => {}
             EngineCommand::SetAudioDevice { device } if settings.device != device => {
@@ -496,10 +527,13 @@ fn run_worker<R>(
 fn start_runtime<R: WorkerRuntime>(
     runtime: &mut R,
     settings: &WorkerSettings,
-    event_tx: &Sender<EngineEvent>,
+    event_tx: &EngineEventSender,
 ) -> bool {
     match runtime.start(settings) {
         Ok(()) => {
+            let _ = event_tx.send(EngineEvent::MidiOutputOpened {
+                name: MIDI_OUTPUT_NAME.to_owned(),
+            });
             let _ = event_tx.send(EngineEvent::AudioDeviceOpened {
                 device_id: settings.device.clone(),
             });
@@ -516,7 +550,7 @@ fn start_runtime<R: WorkerRuntime>(
 
 fn resolve_initial_device<R: WorkerRuntime>(
     runtime: &mut R,
-    event_tx: &Sender<EngineEvent>,
+    event_tx: &EngineEventSender,
     settings: &mut WorkerSettings,
 ) {
     if settings.device_selection_resolved {
@@ -547,7 +581,7 @@ fn resolve_initial_device<R: WorkerRuntime>(
 
 fn enumerate_audio_devices<R: WorkerRuntime>(
     runtime: &mut R,
-    event_tx: &Sender<EngineEvent>,
+    event_tx: &EngineEventSender,
     settings: &mut WorkerSettings,
 ) {
     match runtime.enumerate_audio_devices() {
@@ -572,7 +606,7 @@ fn enumerate_audio_devices<R: WorkerRuntime>(
 
 fn select_audio_device<R: WorkerRuntime>(
     runtime: &mut R,
-    event_tx: &Sender<EngineEvent>,
+    event_tx: &EngineEventSender,
     settings: &mut WorkerSettings,
     was_running: bool,
     device_id: String,
@@ -608,7 +642,7 @@ fn select_audio_device<R: WorkerRuntime>(
 
 fn retry_audio_device<R: WorkerRuntime>(
     runtime: &mut R,
-    event_tx: &Sender<EngineEvent>,
+    event_tx: &EngineEventSender,
     settings: &mut WorkerSettings,
     was_running: bool,
 ) -> bool {
@@ -659,7 +693,7 @@ fn retry_audio_device<R: WorkerRuntime>(
     }
 }
 
-fn publish_runtime_failure(event_tx: &Sender<EngineEvent>, error: RuntimeFailure) {
+fn publish_runtime_failure(event_tx: &EngineEventSender, error: RuntimeFailure) {
     match error {
         RuntimeFailure::AudioDevice(error) => {
             let _ = event_tx.send(EngineEvent::AudioDeviceUnavailable {
@@ -669,6 +703,9 @@ fn publish_runtime_failure(event_tx: &Sender<EngineEvent>, error: RuntimeFailure
         }
         RuntimeFailure::Other(message) => {
             let _ = event_tx.send(EngineEvent::Error { message });
+        }
+        RuntimeFailure::MidiOutput(message) => {
+            let _ = event_tx.send(EngineEvent::MidiOutputUnavailable { message });
         }
         RuntimeFailure::Calibration(message) => {
             let _ = event_tx.send(EngineEvent::CalibrationError { message });
@@ -681,14 +718,17 @@ fn runtime_failure_message(error: &RuntimeFailure) -> String {
         RuntimeFailure::AudioDevice(error) => {
             format!("{}: {}", error.device_id, error.message)
         }
-        RuntimeFailure::Calibration(message) | RuntimeFailure::Other(message) => message.clone(),
+        RuntimeFailure::MidiOutput(message)
+        | RuntimeFailure::Calibration(message)
+        | RuntimeFailure::Other(message) => message.clone(),
     }
 }
 
-fn stop_runtime<R: WorkerRuntime>(runtime: &mut R, event_tx: &Sender<EngineEvent>) -> bool {
+fn stop_runtime<R: WorkerRuntime>(runtime: &mut R, event_tx: &EngineEventSender) -> bool {
     let mut events = Vec::new();
     let result = runtime.stop(&mut events);
     publish_events(event_tx, events);
+    let _ = event_tx.send(EngineEvent::MidiOutputClosed);
     if let Err(message) = result {
         let _ = event_tx.send(EngineEvent::Error { message });
         false
@@ -699,7 +739,7 @@ fn stop_runtime<R: WorkerRuntime>(runtime: &mut R, event_tx: &Sender<EngineEvent
 
 fn reconfigure_runtime<R: WorkerRuntime>(
     runtime: &mut R,
-    event_tx: &Sender<EngineEvent>,
+    event_tx: &EngineEventSender,
     settings: &mut WorkerSettings,
     next_settings: WorkerSettings,
     was_running: bool,
@@ -720,7 +760,7 @@ fn reconfigure_runtime<R: WorkerRuntime>(
     }
 }
 
-fn publish_events(event_tx: &Sender<EngineEvent>, events: Vec<EngineEvent>) {
+fn publish_events(event_tx: &EngineEventSender, events: Vec<EngineEvent>) {
     for event in events {
         let _ = event_tx.send(event);
     }
@@ -888,7 +928,7 @@ impl WorkerRuntime for ProductionRuntime {
             .map_err(RuntimeFailure::AudioDevice)?;
         let sample_rate = capture.sample_rate;
         let hop = capture.hop;
-        let midi = Midi::new().map_err(|error| RuntimeFailure::Other(format!("{error:#}")))?;
+        let midi = Midi::new().map_err(|error| RuntimeFailure::MidiOutput(format!("{error:#}")))?;
         let detector = Detector::new(&args, sample_rate, hop)
             .context("Cannot create detector")
             .map_err(|error| RuntimeFailure::Other(format!("{error:#}")))?;
@@ -1320,6 +1360,7 @@ mod tests {
         provider_state: Arc<Mutex<FakeProviderState>>,
         capture_entered: Option<Sender<()>>,
         fail_first_start: bool,
+        fail_midi_start: bool,
         active_note: Option<u8>,
         calibration_active: bool,
         calibration_samples_per_note: usize,
@@ -1354,6 +1395,7 @@ mod tests {
                 })),
                 capture_entered: None,
                 fail_first_start: false,
+                fail_midi_start: false,
                 active_note: None,
                 calibration_active: false,
                 calibration_samples_per_note: DEFAULT_SAMPLES_PER_NOTE,
@@ -1371,6 +1413,10 @@ mod tests {
                 .unwrap()
                 .fail_starts
                 .insert(device_id.to_owned(), attempts);
+        }
+
+        fn fail_midi_start(&mut self) {
+            self.fail_midi_start = true;
         }
 
         fn with_capture_signal(mut self, capture_entered: Sender<()>) -> Self {
@@ -1392,6 +1438,12 @@ mod tests {
             if self.fail_first_start {
                 self.fail_first_start = false;
                 return Err(RuntimeFailure::Other("fake start failed".to_owned()));
+            }
+            if self.fail_midi_start {
+                self.fail_midi_start = false;
+                return Err(RuntimeFailure::MidiOutput(
+                    "fake MIDI output unavailable".to_owned(),
+                ));
             }
             let mut provider_state = self.provider_state.lock().unwrap();
             if let Some(remaining) = provider_state.fail_starts.get_mut(&settings.device) {
@@ -1547,14 +1599,18 @@ mod tests {
         engine: &PssEngine,
         mut predicate: impl FnMut(&EngineEvent) -> bool,
     ) -> EngineEvent {
+        let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            let event = engine
-                .event_rx
-                .recv_timeout(Duration::from_secs(1))
-                .expect("expected engine event before timeout");
-            if predicate(&event) {
-                return event;
+            match engine.try_recv_event() {
+                Ok(event) if predicate(&event) => return event,
+                Ok(_) | Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => panic!("engine event channel disconnected"),
             }
+            assert!(
+                Instant::now() < deadline,
+                "expected engine event before timeout"
+            );
+            thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -1751,6 +1807,51 @@ mod tests {
     }
 
     #[test]
+    fn midi_output_events_report_open_close_and_recoverable_creation_failure() {
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = FakeRuntime::new(Arc::clone(&actions));
+        runtime.fail_midi_start();
+        let mut engine = spawn_fake(runtime);
+
+        engine.send(EngineCommand::Start).unwrap();
+        assert_eq!(
+            recv_until(&engine, |event| matches!(
+                event,
+                EngineEvent::MidiOutputUnavailable { .. }
+            )),
+            EngineEvent::MidiOutputUnavailable {
+                message: "fake MIDI output unavailable".to_owned(),
+            }
+        );
+        assert_eq!(
+            recv_until(&engine, |event| *event
+                == EngineEvent::StateChanged(EngineState::Stopped)),
+            EngineEvent::StateChanged(EngineState::Stopped)
+        );
+
+        engine.send(EngineCommand::Start).unwrap();
+        assert_eq!(
+            recv_until(&engine, |event| matches!(
+                event,
+                EngineEvent::MidiOutputOpened { .. }
+            )),
+            EngineEvent::MidiOutputOpened {
+                name: MIDI_OUTPUT_NAME.to_owned(),
+            }
+        );
+        recv_until(&engine, |event| {
+            *event == EngineEvent::StateChanged(EngineState::Running)
+        });
+
+        engine.send(EngineCommand::Stop).unwrap();
+        assert_eq!(
+            recv_until(&engine, |event| *event == EngineEvent::MidiOutputClosed),
+            EngineEvent::MidiOutputClosed
+        );
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
     fn calibration_commands_release_midi_and_keep_retry_on_the_requested_sample() {
         let actions = Arc::new(Mutex::new(Vec::new()));
         let mut engine = spawn_fake(FakeRuntime::new(Arc::clone(&actions)));
@@ -1869,6 +1970,13 @@ mod tests {
         recv_until(&engine, |event| {
             *event == EngineEvent::StateChanged(EngineState::Running)
         });
+        assert_eq!(
+            recv_until(&engine, |event| matches!(
+                event,
+                EngineEvent::DetectorModeChanged(_)
+            )),
+            EngineEvent::DetectorModeChanged(DetectorMode::Compare)
+        );
         assert_eq!(
             recv_until(&engine, |event| *event
                 == EngineEvent::NoteOn { midi_note: 60 }),
