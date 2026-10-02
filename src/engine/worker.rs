@@ -351,6 +351,11 @@ trait WorkerRuntime: 'static {
         false
     }
     fn set_template_path(&mut self, _settings: &WorkerSettings, _events: &mut Vec<EngineEvent>) {}
+    fn reload_templates(
+        &mut self,
+        settings: &WorkerSettings,
+        events: &mut Vec<EngineEvent>,
+    ) -> bool;
     fn begin_calibration(
         &mut self,
         _settings: &WorkerSettings,
@@ -582,10 +587,36 @@ fn run_worker<R>(
                 publish_events(&event_tx, events);
             }
             EngineCommand::CancelCalibration => {}
-            EngineCommand::ReloadTemplates { .. } => {
-                let _ = event_tx.send(EngineEvent::Error {
-                    message: "Template reload is not available yet".to_owned(),
-                });
+            EngineCommand::ReloadTemplates { path } => {
+                let mut next_settings = settings.clone();
+                if let Some(path) = path {
+                    next_settings.template_path = path.clone();
+                    next_settings.args.templates = Some(path);
+                }
+                let mut events = Vec::new();
+                let loaded = runtime.reload_templates(&next_settings, &mut events);
+                publish_events(&event_tx, events);
+
+                if running && settings.mode != DetectorMode::Yin {
+                    if loaded {
+                        running = reconfigure_runtime(
+                            &mut runtime,
+                            &event_tx,
+                            &mut settings,
+                            next_settings,
+                            true,
+                        );
+                    } else {
+                        // A running spectral detector must not continue to
+                        // represent a newly requested, invalid template path.
+                        stop_runtime(&mut runtime, &event_tx);
+                        running = false;
+                        settings = next_settings;
+                        let _ = event_tx.send(EngineEvent::StateChanged(EngineState::Stopped));
+                    }
+                } else {
+                    settings = next_settings;
+                }
             }
             EngineCommand::Shutdown => break,
         }
@@ -899,11 +930,12 @@ impl ProductionRuntime {
         }
     }
 
-    fn update_template_status(&mut self, args: &RunArgs, events: &mut Vec<EngineEvent>) {
+    fn update_template_status(&mut self, args: &RunArgs, events: &mut Vec<EngineEvent>) -> bool {
         let (templates, status) = load_configured_templates(&self.current_template_path, args);
         self.templates = templates;
         self.template_status = status.clone();
         events.push(EngineEvent::TemplateStatusChanged(status));
+        matches!(&self.template_status, TemplateStatus::Loaded { .. })
     }
 
     fn ensure_midi(&mut self) -> Result<bool, String> {
@@ -1130,6 +1162,16 @@ impl WorkerRuntime for ProductionRuntime {
         self.args = settings.args.clone();
         self.current_template_path = settings.template_path.clone();
         self.update_template_status(&settings.args, events);
+    }
+
+    fn reload_templates(
+        &mut self,
+        settings: &WorkerSettings,
+        events: &mut Vec<EngineEvent>,
+    ) -> bool {
+        self.args = settings.args.clone();
+        self.current_template_path = settings.template_path.clone();
+        self.update_template_status(&settings.args, events)
     }
 
     fn start(
@@ -1578,6 +1620,9 @@ mod tests {
             samples_per_note: usize,
             template_path: PathBuf,
         },
+        ReloadTemplates {
+            template_path: PathBuf,
+        },
         RetryCalibrationSample,
         CancelCalibration,
     }
@@ -1592,6 +1637,7 @@ mod tests {
         active_note: Option<u8>,
         calibration_active: bool,
         calibration_samples_per_note: usize,
+        template_reload_succeeds: bool,
     }
 
     #[derive(Default)]
@@ -1628,6 +1674,7 @@ mod tests {
                 active_note: None,
                 calibration_active: false,
                 calibration_samples_per_note: DEFAULT_SAMPLES_PER_NOTE,
+                template_reload_succeeds: true,
             }
         }
 
@@ -1706,6 +1753,31 @@ mod tests {
                 events.push(EngineEvent::NoteOff { midi_note: note });
             }
             Ok(())
+        }
+
+        fn reload_templates(
+            &mut self,
+            settings: &WorkerSettings,
+            events: &mut Vec<EngineEvent>,
+        ) -> bool {
+            self.actions
+                .lock()
+                .unwrap()
+                .push(FakeAction::ReloadTemplates {
+                    template_path: settings.template_path.clone(),
+                });
+            if self.template_reload_succeeds {
+                events.push(EngineEvent::TemplateStatusChanged(TemplateStatus::Loaded {
+                    path: settings.template_path.clone(),
+                }));
+                true
+            } else {
+                events.push(EngineEvent::TemplateStatusChanged(TemplateStatus::Error {
+                    path: settings.template_path.clone(),
+                    message: "injected template reload failure".to_owned(),
+                }));
+                false
+            }
         }
 
         fn begin_calibration(
@@ -1854,6 +1926,61 @@ mod tests {
         }
     }
 
+    struct SilentAudioFrames;
+
+    impl crate::engine::audio::AudioFrameSource for SilentAudioFrames {
+        fn try_next_frame(
+            &mut self,
+            _frame: &mut [f32],
+            _timeout: Duration,
+        ) -> Result<Option<u64>> {
+            Ok(None)
+        }
+    }
+
+    struct FakeAudioDeviceProvider;
+
+    impl AudioDeviceProvider for FakeAudioDeviceProvider {
+        fn enumerate_capture_devices(&mut self) -> Result<Vec<AudioInputDevice>, String> {
+            Ok(vec![mock_device("pipewire", "Injected capture")])
+        }
+
+        fn open_capture(
+            &mut self,
+            _device_id: &str,
+            args: &crate::engine::config::AudioArgs,
+        ) -> Result<OpenedAudioCapture, AudioDeviceUnavailable> {
+            Ok(OpenedAudioCapture::new(
+                SilentAudioFrames,
+                args.sample_rate,
+                args.hop,
+            ))
+        }
+    }
+
+    fn completed_calibration_result() -> CalibrationResult {
+        let extractor = FeatureExtractor::new(48_000, 30.0, 2048).unwrap();
+        let mut templates = TemplateFile::empty(48_000, 2048, 30.0, 8.0);
+        for note in 36..=72 {
+            let mut example = vec![0.0; extractor.feature_len()];
+            example[usize::from(note - 36)] = 1.0;
+            templates
+                .notes
+                .insert(note, vec![example; DEFAULT_SAMPLES_PER_NOTE]);
+        }
+        CalibrationResult {
+            templates,
+            note_count: 37,
+            sample_count: 37 * DEFAULT_SAMPLES_PER_NOTE,
+            samples_per_note: DEFAULT_SAMPLES_PER_NOTE,
+            feature_len: extractor.feature_len(),
+            sample_rate: 48_000,
+            fft_size: 2048,
+            window_ms: 30.0,
+            delay_ms: 8.0,
+        }
+    }
+
     fn unique_test_path(label: &str) -> PathBuf {
         let id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1965,6 +2092,86 @@ mod tests {
             TemplateStatus::Loaded { path: path.clone() }
         )));
         assert!(runtime.templates.is_some());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn template_reload_reports_missing_and_invalid_paths_without_loaded_status() {
+        let missing_path = unique_test_path("reload-missing-templates");
+        let invalid_path = unique_test_path("reload-invalid-templates");
+        fs::write(&invalid_path, "{invalid json").unwrap();
+
+        let mut config = AppConfig::default();
+        config.template_path = missing_path.clone();
+        let settings = WorkerSettings::from_app_config(config.clone());
+        let (midi_provider, _) = FakeMidiOutputProvider::available();
+        let mut runtime = ProductionRuntime::new(
+            config.to_run_args(),
+            Box::new(FakeAudioDeviceProvider),
+            Box::new(midi_provider),
+        );
+        let mut events = Vec::new();
+
+        assert!(!runtime.reload_templates(&settings, &mut events));
+        assert_eq!(
+            events,
+            vec![EngineEvent::TemplateStatusChanged(
+                TemplateStatus::NotCalibrated {
+                    path: missing_path.clone(),
+                }
+            )]
+        );
+
+        let mut invalid_settings = settings;
+        invalid_settings.template_path = invalid_path.clone();
+        invalid_settings.args.templates = Some(invalid_path.clone());
+        events.clear();
+        assert!(!runtime.reload_templates(&invalid_settings, &mut events));
+        assert!(matches!(
+            events.as_slice(),
+            [EngineEvent::TemplateStatusChanged(TemplateStatus::Error { path, message })]
+                if path == &invalid_path && message.contains("Invalid spectral template JSON")
+        ));
+        assert!(runtime.templates.is_none());
+
+        fs::remove_file(invalid_path).unwrap();
+    }
+
+    #[test]
+    fn completed_saved_templates_load_and_start_a_spectral_detector_with_injected_capture() {
+        let path = unique_test_path("completed-spectral-templates");
+        TemplatePersistenceTask::spawn(completed_calibration_result(), path.clone())
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        let config = AppConfig {
+            detector_mode: DetectorMode::Spectral,
+            template_path: path.clone(),
+            ..AppConfig::default()
+        };
+        let settings = WorkerSettings::from_app_config(config.clone());
+        let (midi_provider, _) = FakeMidiOutputProvider::available();
+        let mut runtime = ProductionRuntime::new(
+            config.to_run_args(),
+            Box::new(FakeAudioDeviceProvider),
+            Box::new(midi_provider),
+        );
+        let mut events = Vec::new();
+
+        assert!(runtime.reload_templates(&settings, &mut events));
+        assert!(events.contains(&EngineEvent::TemplateStatusChanged(
+            TemplateStatus::Loaded { path: path.clone() }
+        )));
+        runtime.start(&settings, &mut events).unwrap();
+        let detector = runtime.resources.detector.as_mut().unwrap();
+        let outcome = detector
+            .process(&vec![0.0; settings.args.audio.hop])
+            .unwrap();
+        assert!(outcome.yin.is_none());
+        assert!(runtime.resources.detector.is_some());
+        runtime.stop(&mut events).unwrap();
+
         fs::remove_file(path).unwrap();
     }
 
@@ -2223,6 +2430,174 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn start_playing_commands_reload_then_select_spectral_then_start_when_stopped() {
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let path = PathBuf::from("/tmp/saved-calibration-templates.json");
+        let mut engine = spawn_fake(FakeRuntime::new(Arc::clone(&actions)));
+        let mut app_state = crate::ui::state::AppState::default();
+        app_state.select_page(crate::ui::state::Page::Calibration);
+        app_state.reduce_event(
+            EngineEvent::CalibrationCompleted {
+                note_count: 37,
+                sample_count: 185,
+                template_path: path.clone(),
+            },
+            Instant::now(),
+        );
+        let commands = app_state.start_playing_after_calibration().unwrap();
+        assert_eq!(app_state.page, crate::ui::state::Page::Live);
+        assert_eq!(app_state.config.template_path, path);
+        for command in commands {
+            engine.send(command).unwrap();
+        }
+
+        assert_eq!(
+            recv_until(&engine, |event| matches!(
+                event,
+                EngineEvent::TemplateStatusChanged(TemplateStatus::Loaded { .. })
+            )),
+            EngineEvent::TemplateStatusChanged(TemplateStatus::Loaded { path: path.clone() })
+        );
+        assert_eq!(
+            recv_until(&engine, |event| *event
+                == EngineEvent::DetectorModeChanged(DetectorMode::Spectral)),
+            EngineEvent::DetectorModeChanged(DetectorMode::Spectral)
+        );
+        assert_eq!(
+            recv_until(&engine, |event| *event
+                == EngineEvent::StateChanged(EngineState::Running)),
+            EngineEvent::StateChanged(EngineState::Running)
+        );
+        engine.shutdown().unwrap();
+
+        let actions = actions.lock().unwrap();
+        assert_eq!(
+            &actions[..2],
+            &[
+                FakeAction::ReloadTemplates {
+                    template_path: path,
+                },
+                FakeAction::Start {
+                    mode: DetectorMode::Spectral,
+                    device: "pipewire".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_reload_reports_template_error_and_stops_running_spectral_detector() {
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let path = PathBuf::from("/tmp/invalid-calibration-templates.json");
+        let mut runtime = FakeRuntime::new(Arc::clone(&actions));
+        runtime.template_reload_succeeds = false;
+        let args = default_run_args();
+        let mut settings = WorkerSettings::from_args(&args);
+        settings.mode = DetectorMode::Spectral;
+        settings.args.detector = DetectorMode::Spectral;
+        let mut engine = spawn_fake_with_settings(runtime, settings);
+
+        engine.send(EngineCommand::Start).unwrap();
+        recv_until(&engine, |event| {
+            *event == EngineEvent::StateChanged(EngineState::Running)
+        });
+        recv_until(&engine, |event| {
+            *event == EngineEvent::NoteOn { midi_note: 60 }
+        });
+        engine
+            .send(EngineCommand::ReloadTemplates {
+                path: Some(path.clone()),
+            })
+            .unwrap();
+
+        assert_eq!(
+            recv_until(&engine, |event| matches!(
+                event,
+                EngineEvent::TemplateStatusChanged(TemplateStatus::Error { .. })
+            )),
+            EngineEvent::TemplateStatusChanged(TemplateStatus::Error {
+                path: path.clone(),
+                message: "injected template reload failure".to_owned(),
+            })
+        );
+        assert_eq!(
+            recv_until(&engine, |event| *event
+                == EngineEvent::NoteOff { midi_note: 60 }),
+            EngineEvent::NoteOff { midi_note: 60 }
+        );
+        assert_eq!(
+            recv_until(&engine, |event| *event
+                == EngineEvent::StateChanged(EngineState::Stopped)),
+            EngineEvent::StateChanged(EngineState::Stopped)
+        );
+        engine.shutdown().unwrap();
+
+        let actions = actions.lock().unwrap();
+        assert!(actions.contains(&FakeAction::ReloadTemplates {
+            template_path: path,
+        }));
+        assert!(actions.contains(&FakeAction::Stop {
+            released_note: Some(60),
+        }));
+    }
+
+    #[test]
+    fn successful_reload_releases_and_restarts_a_running_spectral_detector() {
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let path = PathBuf::from("/tmp/refreshed-spectral-templates.json");
+        let args = default_run_args();
+        let mut settings = WorkerSettings::from_args(&args);
+        settings.mode = DetectorMode::Spectral;
+        settings.args.detector = DetectorMode::Spectral;
+        let mut engine = spawn_fake_with_settings(FakeRuntime::new(Arc::clone(&actions)), settings);
+
+        engine.send(EngineCommand::Start).unwrap();
+        recv_until(&engine, |event| {
+            *event == EngineEvent::StateChanged(EngineState::Running)
+        });
+        recv_until(&engine, |event| {
+            *event == EngineEvent::NoteOn { midi_note: 60 }
+        });
+        engine
+            .send(EngineCommand::ReloadTemplates {
+                path: Some(path.clone()),
+            })
+            .unwrap();
+
+        assert_eq!(
+            recv_until(&engine, |event| matches!(
+                event,
+                EngineEvent::TemplateStatusChanged(TemplateStatus::Loaded { .. })
+            )),
+            EngineEvent::TemplateStatusChanged(TemplateStatus::Loaded { path: path.clone() })
+        );
+        assert_eq!(
+            recv_until(&engine, |event| *event
+                == EngineEvent::NoteOff { midi_note: 60 }),
+            EngineEvent::NoteOff { midi_note: 60 }
+        );
+        assert_eq!(
+            recv_until(&engine, |event| *event
+                == EngineEvent::StateChanged(EngineState::Running)),
+            EngineEvent::StateChanged(EngineState::Running)
+        );
+        engine.shutdown().unwrap();
+
+        let actions = actions.lock().unwrap();
+        let starts: Vec<_> = actions
+            .iter()
+            .filter_map(|action| match action {
+                FakeAction::Start { mode, .. } => Some(*mode),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts, vec![DetectorMode::Spectral, DetectorMode::Spectral]);
+        assert!(actions.contains(&FakeAction::ReloadTemplates {
+            template_path: path,
+        }));
     }
 
     #[test]

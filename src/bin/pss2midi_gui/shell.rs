@@ -235,6 +235,31 @@ impl Pss2MidiApp {
         }
     }
 
+    fn start_playing_from_calibration(&mut self, cx: &mut Context<Self>) {
+        let Some(commands) = self.state.start_playing_after_calibration() else {
+            return;
+        };
+        self.queue_settings_save();
+
+        for command in commands {
+            let result = self
+                .engine
+                .as_ref()
+                .ok_or(())
+                .and_then(|engine| engine.send(command).map_err(|_| ()));
+            if result.is_err() {
+                self.state.reduce_event(
+                    EngineEvent::Error {
+                        message: "The engine worker is unavailable for Start Playing".to_owned(),
+                    },
+                    Instant::now(),
+                );
+                break;
+            }
+        }
+        cx.notify();
+    }
+
     fn begin_settings_edit(
         &mut self,
         field: SettingField,
@@ -1229,7 +1254,7 @@ fn calibration_progress_panel(
 
     if view.status == CalibrationStatus::Completed {
         if let Some(completion) = &view.completion {
-            panel = panel.child(calibration_completion_content(completion));
+            panel = panel.child(calibration_completion_content(completion, cx));
         }
         return panel;
     }
@@ -1639,6 +1664,7 @@ fn format_sample_peak(peak: Option<f32>) -> String {
 
 fn calibration_completion_content(
     completion: &pss2midi::ui::state::CalibrationCompletion,
+    cx: &mut Context<Pss2MidiApp>,
 ) -> impl IntoElement {
     div()
         .w_full()
@@ -1684,7 +1710,6 @@ fn calibration_completion_content(
                         )),
                 ),
         )
-        // Task 3.2 connects this visible CTA to template reload and playback.
         .child(
             div()
                 .id("calibration-start-playing")
@@ -1698,6 +1723,10 @@ fn calibration_completion_content(
                 .text_size(px(theme::FONT_SMALL))
                 .text_color(rgb(theme::ACCENT))
                 .font_weight(FontWeight::SEMIBOLD)
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.start_playing_from_calibration(cx);
+                }))
                 .child("Start Playing"),
         )
 }

@@ -32,7 +32,11 @@ pub(crate) struct OpenedAudioCapture {
 }
 
 impl OpenedAudioCapture {
-    fn new<R: AudioFrameSource + 'static>(reader: R, sample_rate: u32, hop: usize) -> Self {
+    pub(crate) fn new<R: AudioFrameSource + 'static>(
+        reader: R,
+        sample_rate: u32,
+        hop: usize,
+    ) -> Self {
         Self {
             reader: Box::new(reader),
             sample_rate,

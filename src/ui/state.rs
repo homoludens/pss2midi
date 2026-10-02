@@ -391,6 +391,34 @@ impl AppState {
         self.page = page;
     }
 
+    /// Prepare the saved calibration result for playback and return commands
+    /// in the order the engine must apply them. Engine mode/running state stay
+    /// event-driven; only the selected page and persisted template preference
+    /// are updated immediately.
+    pub fn start_playing_after_calibration(&mut self) -> Option<Vec<EngineCommand>> {
+        if self.engine_state == EngineState::ShuttingDown
+            || self.calibration.status != CalibrationStatus::Completed
+        {
+            return None;
+        }
+        let completion = self.calibration.completion.as_ref()?;
+        let template_path = completion.template_path.clone();
+
+        self.config.template_path = template_path.clone();
+        self.page = Page::Live;
+
+        let mut commands = vec![
+            EngineCommand::ReloadTemplates {
+                path: Some(template_path),
+            },
+            EngineCommand::SetDetectorMode(DetectorMode::Spectral),
+        ];
+        if self.engine_state == EngineState::Stopped {
+            commands.push(EngineCommand::Start);
+        }
+        Some(commands)
+    }
+
     /// Apply an engine update using a monotonic meter timestamp and the current
     /// wall clock for timestamping semantic event history.
     ///
@@ -779,6 +807,86 @@ mod tests {
             state.select_page(page);
             assert_eq!(state.page, page);
         }
+    }
+
+    #[test]
+    fn completed_calibration_start_playing_uses_saved_path_and_starts_when_stopped() {
+        let template_path = PathBuf::from("/tmp/completed-pss-templates.json");
+        let mut state = AppState::default();
+        state.select_page(Page::Calibration);
+        state.reduce_event(
+            EngineEvent::CalibrationCompleted {
+                note_count: 37,
+                sample_count: 185,
+                template_path: template_path.clone(),
+            },
+            at(0),
+        );
+
+        let commands = state.start_playing_after_calibration().unwrap();
+
+        assert_eq!(state.page, Page::Live);
+        assert_eq!(state.config.template_path, template_path);
+        // The requested mode is not presented as active until the worker
+        // confirms it with DetectorModeChanged.
+        assert_eq!(state.config.detector_mode, DetectorMode::Yin);
+        assert_eq!(
+            commands,
+            vec![
+                EngineCommand::ReloadTemplates {
+                    path: Some(template_path),
+                },
+                EngineCommand::SetDetectorMode(DetectorMode::Spectral),
+                EngineCommand::Start,
+            ]
+        );
+    }
+
+    #[test]
+    fn completed_calibration_start_playing_does_not_start_a_running_engine() {
+        let template_path = PathBuf::from("/tmp/completed-pss-templates.json");
+        let mut state = AppState::default();
+        state.select_page(Page::Calibration);
+        state.reduce_event(
+            EngineEvent::CalibrationCompleted {
+                note_count: 37,
+                sample_count: 185,
+                template_path: template_path.clone(),
+            },
+            at(0),
+        );
+        state.reduce_event(EngineEvent::StateChanged(EngineState::Running), at(1));
+
+        let commands = state.start_playing_after_calibration().unwrap();
+
+        assert_eq!(state.page, Page::Live);
+        assert_eq!(state.config.template_path, template_path);
+        assert_eq!(
+            commands,
+            vec![
+                EngineCommand::ReloadTemplates {
+                    path: Some(template_path),
+                },
+                EngineCommand::SetDetectorMode(DetectorMode::Spectral),
+            ]
+        );
+    }
+
+    #[test]
+    fn start_playing_requires_saved_completion_and_ignores_a_shutting_down_worker() {
+        let mut state = AppState::default();
+        assert!(state.start_playing_after_calibration().is_none());
+
+        state.reduce_event(
+            EngineEvent::CalibrationCompleted {
+                note_count: 37,
+                sample_count: 185,
+                template_path: PathBuf::from("/tmp/completed-pss-templates.json"),
+            },
+            at(0),
+        );
+        state.reduce_event(EngineEvent::StateChanged(EngineState::ShuttingDown), at(1));
+        assert!(state.start_playing_after_calibration().is_none());
     }
 
     #[test]
