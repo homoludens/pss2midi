@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 
 #[derive(Parser, Debug)]
 #[command(name = "pss2midi", about = "Low-latency Yamaha PSS-F30 audio to MIDI")]
@@ -20,7 +21,8 @@ pub enum Commands {
     Calibrate(CalibrateArgs),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
 pub enum DetectorMode {
     Yin,
     Spectral,

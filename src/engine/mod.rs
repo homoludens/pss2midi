@@ -3,6 +3,7 @@
 //! This module is shared by the command-line application and the desktop GUI
 //! library consumer. It intentionally contains no GPUI types or dependencies.
 
+pub mod app_config;
 pub mod audio;
 mod audio_device;
 pub mod calibration;
@@ -15,6 +16,11 @@ pub mod onset;
 pub mod templates;
 mod worker;
 
+pub use app_config::{
+    default_config_path, load_config, load_config_from, load_config_or_default,
+    load_config_or_default_from, save_config, save_config_to, AdvancedSettings, AppConfig,
+    AudioSettings, ConfigError, ConfigLoadResult, ConfigValidationError, SpectralSettings,
+};
 pub use audio_device::AudioInputDevice;
 pub use detector::{DetectorOutcome, NoteDecision, SpectralResult, YinDecision, YinResult};
 pub use worker::{EngineCommand, EngineEvent, EngineState, PssEngine};

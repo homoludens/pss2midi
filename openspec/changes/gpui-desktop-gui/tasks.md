@@ -6,7 +6,7 @@
 - [x] 1.4 Refactor detector processing to return typed note decisions, YIN/spectral results, latency, confidence/margin, and ranked matches instead of UI-relevant stdout output; verify existing detector regression tests and new result tests pass.
 - [x] 1.5 Implement worker handling for start, stop, mode changes, device changes, and shutdown, including active-note release and bounded command responsiveness during capture; verify lifecycle and mode-transition tests pass.
 - [x] 1.6 Add an engine-level audio-device provider for enumeration, selection, and recoverable open failures; verify saved-device/default selection and unavailable-device behavior with provider tests.
-- [ ] 1.7 Add validated serde settings at `~/.config/pss2midi/config.json`, keeping templates separate and saving outside audio processing; verify round-trip, safe-default, invalid-config, and atomic-save behavior.
+- [x] 1.7 Add validated serde settings at `~/.config/pss2midi/config.json`, keeping templates separate and saving outside audio processing; verify round-trip, safe-default, invalid-config, and atomic-save behavior.
 - [ ] 1.8 Extract calibration into an engine session with quality checks, retry/cancel, progress events, and a separate template persistence task; verify rejected samples do not advance and completed templates save/load successfully.
 
 ## 2. GPUI app and views
