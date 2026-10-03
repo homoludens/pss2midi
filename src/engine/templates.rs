@@ -28,8 +28,12 @@ pub struct RankedMatch {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Classification {
     pub note: u8,
+    /// Absolute cosine match against a stored example of the winning note.
     pub score: f32,
+    /// Absolute cosine match for the runner-up note.
     pub second_score: f32,
+    /// Separation between the two highest ranking scores. Spectral ranking
+    /// uses mean-centered features; the legacy classifier uses raw cosine.
     pub margin: f32,
     pub accepted: bool,
     pub ranked_matches: Vec<RankedMatch>,
@@ -177,6 +181,123 @@ impl TemplateFile {
             ranked_matches,
         })
     }
+
+    /// Rank notes by the part of the spectrum that distinguishes this keyboard's
+    /// templates. The absolute match still uses the original cosine score, so
+    /// existing minimum-score settings keep their meaning.
+    pub fn classify_spectral(
+        &self,
+        observation: &[f32],
+        minimum_score: f32,
+        minimum_margin: f32,
+    ) -> Result<Classification> {
+        let first_bin =
+            ((50.0 * self.fft_size as f32 / self.sample_rate as f32).ceil() as usize).max(1);
+        let first = ((100.0 * self.fft_size as f32 / self.sample_rate as f32).ceil() as usize)
+            .saturating_sub(first_bin);
+        let last = ((3_000.0 * self.fft_size as f32 / self.sample_rate as f32).floor() as usize)
+            .saturating_sub(first_bin)
+            .min(observation.len().saturating_sub(1));
+        ensure!(first < last, "spectral feature range is too short");
+        let band = first..last + 1;
+
+        let mut mean = vec![0.0f32; band.len()];
+        let mut count = 0usize;
+        for note in MIN_MIDI..=MAX_MIDI {
+            let examples = self
+                .notes
+                .get(&(note as u8))
+                .ok_or_else(|| anyhow::anyhow!("template file is missing MIDI note {note}"))?;
+            ensure!(
+                !examples.is_empty(),
+                "template MIDI note {note} has no examples"
+            );
+            for example in examples {
+                ensure!(
+                    example.len() == observation.len(),
+                    "template feature length mismatch for MIDI note {note}"
+                );
+                for (average, value) in mean.iter_mut().zip(&example[band.clone()]) {
+                    *average += *value;
+                }
+                count += 1;
+            }
+        }
+        ensure!(count > 0, "spectral templates are empty");
+        for value in &mut mean {
+            *value /= count as f32;
+        }
+        let centered_observation: Vec<f32> = observation[band.clone()]
+            .iter()
+            .zip(&mean)
+            .map(|(value, average)| value - average)
+            .collect();
+        let observation_norm = vector_norm(&centered_observation);
+        if observation_norm <= 1e-12 {
+            return self.classify(observation, minimum_score, minimum_margin);
+        }
+
+        let mut scores = Vec::with_capacity((MAX_MIDI - MIN_MIDI + 1) as usize);
+        for note in MIN_MIDI..=MAX_MIDI {
+            let examples = &self.notes[&(note as u8)];
+            let mut similarities = Vec::with_capacity(examples.len());
+            let mut raw_score = f32::NEG_INFINITY;
+            for example in examples {
+                raw_score = raw_score.max(cosine_similarity(observation, example)?);
+                let centered: Vec<f32> = example[band.clone()]
+                    .iter()
+                    .zip(&mean)
+                    .map(|(value, average)| value - average)
+                    .collect();
+                let norm = vector_norm(&centered);
+                if norm > 1e-12 {
+                    let dot = centered
+                        .iter()
+                        .zip(&centered_observation)
+                        .map(|(left, right)| left * right)
+                        .sum::<f32>();
+                    similarities.push(dot / (norm * observation_norm));
+                }
+            }
+            similarities.sort_by(|left, right| right.total_cmp(left));
+            // Map cosine similarity from [-1, 1] to the UI's [0, 1] scale.
+            let relative_score = 0.5
+                + 0.5 * similarities.iter().take(2).sum::<f32>()
+                    / similarities.len().min(2).max(1) as f32;
+            scores.push((note as u8, relative_score, raw_score));
+        }
+        scores.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        if scores.len() < 2 {
+            bail!("at least two note templates are required");
+        }
+        let (note, relative_score, score) = scores[0];
+        let margin = relative_score - scores[1].1;
+        let ranked_matches = scores
+            .iter()
+            .take(3)
+            .map(|(note, relative_score, _)| RankedMatch {
+                note: *note,
+                score: *relative_score,
+            })
+            .collect();
+        Ok(Classification {
+            note,
+            score,
+            second_score: scores[1].2,
+            margin,
+            accepted: score >= minimum_score && margin >= minimum_margin,
+            ranked_matches,
+        })
+    }
+}
+
+fn vector_norm(values: &[f32]) -> f32 {
+    values.iter().map(|value| value * value).sum::<f32>().sqrt()
 }
 
 pub fn cosine_similarity(left: &[f32], right: &[f32]) -> Result<f32> {
@@ -295,6 +416,60 @@ mod tests {
                     score: 0.6,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn spectral_classifier_separates_notes_with_a_shared_spectrum() {
+        let mut templates = TemplateFile::empty(48_000, 2048, 30.0, 8.0);
+        for note in MIN_MIDI..=MAX_MIDI {
+            let mut feature = vec![0.5; 339];
+            feature[20 + (note - MIN_MIDI) as usize] += 0.5;
+            let norm = vector_norm(&feature);
+            feature.iter_mut().for_each(|value| *value /= norm);
+            templates
+                .notes
+                .insert(note as u8, vec![feature.clone(), feature]);
+        }
+        let observation = templates.notes[&60][0].clone();
+        let original = templates.classify(&observation, 0.75, 0.03).unwrap();
+        assert!(
+            !original.accepted,
+            "raw cosine obscures the note difference"
+        );
+
+        let improved = templates
+            .classify_spectral(&observation, 0.75, 0.03)
+            .unwrap();
+        assert_eq!(improved.note, 60);
+        assert!(improved.accepted, "{improved:?}");
+        assert!(improved.margin >= 0.03);
+        assert_eq!(improved.ranked_matches[0].note, 60);
+    }
+
+    #[test]
+    fn spectral_classifier_respects_raw_match_and_separation_thresholds() {
+        let mut templates = TemplateFile::empty(48_000, 2048, 30.0, 8.0);
+        for note in MIN_MIDI..=MAX_MIDI {
+            let mut feature = vec![0.5; 339];
+            feature[20 + (note - MIN_MIDI) as usize] += 0.5;
+            let norm = vector_norm(&feature);
+            feature.iter_mut().for_each(|value| *value /= norm);
+            templates.notes.insert(note as u8, vec![feature]);
+        }
+        let mut observation = templates.notes[&60][0].clone();
+        observation[100] += 0.01;
+        assert!(
+            !templates
+                .classify_spectral(&observation, 1.0, 0.03)
+                .unwrap()
+                .accepted
+        );
+        assert!(
+            !templates
+                .classify_spectral(&observation, 0.75, 1.0)
+                .unwrap()
+                .accepted
         );
     }
 

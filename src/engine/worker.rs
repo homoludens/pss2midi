@@ -3,7 +3,7 @@
 use std::{
     fs, io,
     path::PathBuf,
-    sync::mpsc::{self, Receiver, RecvError, RecvTimeoutError, SendError, Sender, TryRecvError},
+    sync::mpsc::{self, Receiver, RecvError, SendError, Sender, TryRecvError},
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -402,9 +402,11 @@ fn run_worker<R>(
 
     loop {
         let command = if running || calibrating {
-            match command_rx.recv_timeout(COMMAND_POLL_INTERVAL) {
+            // A 128-sample frame arrives every 2.7 ms at 48 kHz. Waiting for
+            // a command before each read would fall behind the audio stream.
+            match command_rx.try_recv() {
                 Ok(command) => command,
-                Err(RecvTimeoutError::Timeout) => {
+                Err(TryRecvError::Empty) => {
                     let mut events = Vec::new();
                     match runtime.capture_step(CAPTURE_POLL_INTERVAL, &mut events) {
                         Ok(status) => {
@@ -435,7 +437,7 @@ fn run_worker<R>(
                     }
                     continue;
                 }
-                Err(RecvTimeoutError::Disconnected) => break,
+                Err(TryRecvError::Disconnected) => break,
             }
         } else {
             match command_rx.recv() {
@@ -1355,6 +1357,9 @@ impl WorkerRuntime for ProductionRuntime {
         }
 
         if self.resources.detector.is_none() {
+            // Calibration persistence can outlive its capture stream. Poll it
+            // at a bounded interval without spinning on an idle worker.
+            thread::sleep(COMMAND_POLL_INTERVAL);
             return Ok(CaptureStepStatus {
                 calibration_active: self.calibration_active(),
             });
@@ -2440,14 +2445,25 @@ mod tests {
         );
         engine.shutdown().unwrap();
         assert!(engine.worker.is_none(), "repeated shutdown must not rejoin");
+        let actions = actions.lock().unwrap();
+        assert!(
+            actions
+                .iter()
+                .filter(|action| **action == FakeAction::CaptureWait(CAPTURE_POLL_INTERVAL))
+                .count()
+                >= 2
+        );
         assert_eq!(
-            *actions.lock().unwrap(),
+            actions
+                .iter()
+                .filter(|action| !matches!(action, FakeAction::CaptureWait(_)))
+                .cloned()
+                .collect::<Vec<_>>(),
             vec![
                 FakeAction::Start {
                     mode: DetectorMode::Yin,
                     device: "pipewire".to_owned(),
                 },
-                FakeAction::CaptureWait(CAPTURE_POLL_INTERVAL),
                 FakeAction::Stop {
                     released_note: Some(60),
                 },
@@ -2455,7 +2471,6 @@ mod tests {
                     mode: DetectorMode::Yin,
                     device: "pipewire".to_owned(),
                 },
-                FakeAction::CaptureWait(CAPTURE_POLL_INTERVAL),
                 FakeAction::Stop {
                     released_note: Some(60),
                 },

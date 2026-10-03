@@ -267,7 +267,7 @@ impl DetectorCard {
                     result.note
                 );
                 let detail = format!(
-                    "Confidence {:.3} · margin {:.3}",
+                    "Raw match {:.3} · separation {:.3}",
                     result.confidence, result.margin
                 );
                 if result.accepted {

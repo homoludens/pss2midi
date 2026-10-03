@@ -1,5 +1,5 @@
 use alsa::{
-    pcm::{Access, Format, HwParams, IO, PCM},
+    pcm::{Access, Format, HwParams, State, IO, PCM},
     Direction, ValueOr,
 };
 use anyhow::{Context, Result};
@@ -39,6 +39,12 @@ fn open_capture_with_mode(args: &AudioConfig, nonblocking: bool) -> Result<(PCM,
     }
 
     pcm.prepare()?;
+    if nonblocking {
+        // The worker waits for readiness before its first read. A prepared ALSA
+        // capture PCM may not become ready until capture has been started.
+        pcm.start()
+            .with_context(|| format!("Cannot start ALSA capture PCM '{}'", args.device))?;
+    }
     Ok((pcm, actual_rate, actual_period as usize))
 }
 
@@ -126,6 +132,12 @@ impl CaptureFrameReader {
                 }
                 Err(error) => {
                     self.pcm.try_recover(error, false)?;
+                    // Recovery from an overrun prepares a capture stream, but
+                    // this reader waits for readiness before reading again.
+                    // Start it here so the next wait can receive frames.
+                    if self.pcm.state() == State::Prepared {
+                        self.pcm.start()?;
+                    }
                     self.raw_offset = 0;
                     self.raw_len = 0;
                     self.pending_fill = 0;

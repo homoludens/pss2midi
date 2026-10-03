@@ -2180,7 +2180,7 @@ fn spectral_matches_panel(view: &LiveViewModel) -> impl IntoElement {
                 .text_size(px(theme::FONT_SMALL))
                 .text_color(rgb(theme::TEXT_PRIMARY))
                 .font_weight(FontWeight::SEMIBOLD)
-                .child("Top spectral matches"),
+                .child("Top spectral matches (relative)"),
         );
 
     if view.ranked_matches.is_empty() {

@@ -476,7 +476,7 @@ impl Detector {
                         self.templates
                             .as_ref()
                             .expect("spectral templates are initialized")
-                            .classify(
+                            .classify_spectral(
                                 &features,
                                 self.spectral_min_score,
                                 self.spectral_min_margin,
