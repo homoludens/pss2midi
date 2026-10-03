@@ -4,8 +4,9 @@ use std::{
 };
 
 use gpui::{
-    div, prelude::*, px, rgb, size, App, Context, CursorStyle, FocusHandle, FontWeight,
-    KeyDownEvent, MouseButton, Render, Subscription, Task, Window, WindowBounds, WindowOptions,
+    div, point, prelude::*, px, relative, rgb, size, App, Context, CursorStyle, FocusHandle,
+    FontWeight, KeyDownEvent, MouseButton, Render, ScrollHandle, Subscription, Task, Window,
+    WindowBounds, WindowOptions,
 };
 use pss2midi::{
     engine::{
@@ -46,6 +47,9 @@ struct Pss2MidiApp {
     show_log: bool,
     audio_device_menu_open: bool,
     advanced_settings_expanded: bool,
+    live_scroll_handle: ScrollHandle,
+    calibration_scroll_handle: ScrollHandle,
+    settings_scroll_handle: ScrollHandle,
     settings_text_edit: Option<SettingsTextEdit>,
     settings_focus_handle: FocusHandle,
     settings_save_sender: async_channel::Sender<ConfigSaveRequest>,
@@ -104,6 +108,9 @@ impl Pss2MidiApp {
             show_log: true,
             audio_device_menu_open: false,
             advanced_settings_expanded: ADVANCED_SETTINGS_EXPANDED_BY_DEFAULT,
+            live_scroll_handle: ScrollHandle::new(),
+            calibration_scroll_handle: ScrollHandle::new(),
+            settings_scroll_handle: ScrollHandle::new(),
             settings_text_edit: None,
             settings_focus_handle: cx.focus_handle(),
             settings_save_sender,
@@ -625,7 +632,7 @@ impl Pss2MidiApp {
             ),
         };
 
-        let content = div().flex_1().min_h_0();
+        let content = div().flex().flex_col().flex_1().min_h_0();
         let content = match self.state.page {
             Page::Live => content.child(self.live_dashboard(cx)),
             Page::Calibration => content.child(self.calibration_dashboard(cx)),
@@ -668,115 +675,190 @@ impl Pss2MidiApp {
             .child(content)
     }
 
+    fn page_scrollbar(
+        &self,
+        scrollbar_id: &'static str,
+        scroll_handle: &ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let viewport_height = scroll_handle.bounds().size.height.as_f32();
+        let max_scroll = scroll_handle.max_offset().y.as_f32();
+        let thumb_fraction = if max_scroll > 0.0 && viewport_height > 0.0 {
+            (viewport_height / (viewport_height + max_scroll)).clamp(0.12, 1.0)
+        } else {
+            0.22
+        };
+        let scroll_fraction = if max_scroll > 0.0 {
+            (-scroll_handle.offset().y.as_f32() / max_scroll).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let thumb_position = scroll_fraction * (1.0 - thumb_fraction);
+        let click_handle = scroll_handle.clone();
+
+        div()
+            .id(scrollbar_id)
+            .absolute()
+            .top(px(5.0))
+            .bottom(px(5.0))
+            .right(px(0.0))
+            .w(px(12.0))
+            .flex()
+            .justify_center()
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |_, event, _, cx| {
+                    let bounds = click_handle.bounds();
+                    let max_scroll = click_handle.max_offset().y;
+                    if max_scroll > px(0.0) && bounds.size.height > px(0.0) {
+                        let fraction = ((event.position.y - bounds.origin.y) / bounds.size.height)
+                            .clamp(0.0, 1.0);
+                        let offset = click_handle.offset();
+                        click_handle.set_offset(point(offset.x, -max_scroll * fraction));
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(
+                div()
+                    .relative()
+                    .w(px(5.0))
+                    .h_full()
+                    .rounded_full()
+                    .bg(rgb(theme::BORDER))
+                    .child(
+                        div()
+                            .absolute()
+                            .top(relative(thumb_position))
+                            .left_0()
+                            .right_0()
+                            .h(relative(thumb_fraction))
+                            .rounded_full()
+                            .bg(rgb(theme::ACCENT)),
+                    ),
+            )
+    }
+
     fn live_dashboard(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = LiveViewModel::from_state(&self.state);
 
         div()
+            .relative()
             .flex_1()
             .min_h_0()
             .w_full()
-            .id("live-dashboard-scroll")
-            .overflow_y_scroll()
             .child(
                 div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap(px(theme::SPACE_MD))
-                    .pb(px(theme::SPACE_MD))
-                    .child(live_controls(
-                        &self.state,
-                        self.audio_device_menu_open,
-                        None,
-                        cx,
-                    ))
+                    .size_full()
+                    .pr(px(16.0))
+                    .id("live-dashboard-scroll")
+                    .overflow_y_scroll()
+                    .track_scroll(&self.live_scroll_handle)
                     .child(
                         div()
                             .w_full()
                             .flex()
-                            .items_stretch()
-                            .gap(px(theme::SPACE_SM))
-                            .child(dominant_note_panel(&view))
-                            .child(input_levels_panel(&view)),
-                    )
-                    .child(comparison_panel(&view))
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_stretch()
-                            .gap(px(theme::SPACE_SM))
-                            .child(div().flex_1().min_w_0().child(DetectorCard::yin(
-                                view.yin_result.as_ref(),
-                                view.yin_is_output,
-                            )))
-                            .child(div().flex_1().min_w_0().child(DetectorCard::spectral(
-                                view.spectral_result.as_ref(),
-                                view.spectral_is_output,
-                            ))),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_stretch()
-                            .gap(px(theme::SPACE_SM))
-                            .child(spectral_scores_panel(&view))
-                            .child(spectral_matches_panel(&view)),
-                    )
-                    .child(keyboard_panel(&view))
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(theme::SPACE_SM))
+                            .flex_col()
+                            .gap(px(theme::SPACE_MD))
+                            .pb(px(theme::SPACE_MD))
+                            .child(live_controls(
+                                &self.state,
+                                self.audio_device_menu_open,
+                                None,
+                                cx,
+                            ))
                             .child(
                                 div()
-                                    .text_size(px(theme::FONT_SMALL))
-                                    .text_color(rgb(theme::TEXT_PRIMARY))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Recent events"),
+                                    .w_full()
+                                    .flex()
+                                    .items_stretch()
+                                    .gap(px(theme::SPACE_SM))
+                                    .child(dominant_note_panel(&view))
+                                    .child(input_levels_panel(&view)),
+                            )
+                            .child(comparison_panel(&view))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .items_stretch()
+                                    .gap(px(theme::SPACE_SM))
+                                    .child(div().flex_1().min_w_0().child(DetectorCard::yin(
+                                        view.yin_result.as_ref(),
+                                        view.yin_is_output,
+                                    )))
+                                    .child(div().flex_1().min_w_0().child(DetectorCard::spectral(
+                                        view.spectral_result.as_ref(),
+                                        view.spectral_is_output,
+                                    ))),
                             )
                             .child(
                                 div()
-                                    .id("live-show-log-toggle")
+                                    .w_full()
+                                    .flex()
+                                    .items_stretch()
+                                    .gap(px(theme::SPACE_SM))
+                                    .child(spectral_scores_panel(&view))
+                                    .child(spectral_matches_panel(&view)),
+                            )
+                            .child(keyboard_panel(&view))
+                            .child(
+                                div()
+                                    .w_full()
                                     .flex()
                                     .items_center()
+                                    .justify_between()
                                     .gap(px(theme::SPACE_SM))
-                                    .px(px(theme::SPACE_SM))
-                                    .py(px(theme::SPACE_XS))
-                                    .rounded_md()
-                                    .bg(rgb(theme::PANEL_INSET))
-                                    .border_1()
-                                    .border_color(rgb(theme::BORDER))
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.show_log = !this.show_log;
-                                        cx.notify();
-                                    }))
                                     .child(
                                         div()
-                                            .text_size(px(theme::FONT_CAPTION))
-                                            .text_color(rgb(theme::TEXT_SECONDARY))
-                                            .child("Show log"),
+                                            .text_size(px(theme::FONT_SMALL))
+                                            .text_color(rgb(theme::TEXT_PRIMARY))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child("Recent events"),
                                     )
                                     .child(
-                                        StatusBadge::new(
-                                            if self.show_log { "ON" } else { "OFF" },
-                                            if self.show_log {
-                                                StatusTone::Accent
-                                            } else {
-                                                StatusTone::Neutral
-                                            },
-                                        )
-                                        .render(),
+                                        div()
+                                            .id("live-show-log-toggle")
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(theme::SPACE_SM))
+                                            .px(px(theme::SPACE_SM))
+                                            .py(px(theme::SPACE_XS))
+                                            .rounded_md()
+                                            .bg(rgb(theme::PANEL_INSET))
+                                            .border_1()
+                                            .border_color(rgb(theme::BORDER))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.show_log = !this.show_log;
+                                                cx.notify();
+                                            }))
+                                            .child(
+                                                div()
+                                                    .text_size(px(theme::FONT_CAPTION))
+                                                    .text_color(rgb(theme::TEXT_SECONDARY))
+                                                    .child("Show log"),
+                                            )
+                                            .child(
+                                                StatusBadge::new(
+                                                    if self.show_log { "ON" } else { "OFF" },
+                                                    if self.show_log {
+                                                        StatusTone::Accent
+                                                    } else {
+                                                        StatusTone::Neutral
+                                                    },
+                                                )
+                                                .render(),
+                                            ),
                                     ),
+                            )
+                            .child(
+                                EventLog::new(&self.state.recent_events, self.show_log).render(),
                             ),
-                    )
-                    .child(EventLog::new(&self.state.recent_events, self.show_log).render()),
+                    ),
             )
+            .child(self.page_scrollbar("live-dashboard-scrollbar", &self.live_scroll_handle, cx))
     }
 
     fn calibration_dashboard(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -784,12 +866,6 @@ impl Pss2MidiApp {
             &self.state.calibration,
             self.state.audio_levels,
         );
-        let mut page = div()
-            .flex_1()
-            .min_h_0()
-            .w_full()
-            .id("calibration-dashboard-scroll")
-            .overflow_y_scroll();
         let mut content = div()
             .w_full()
             .flex()
@@ -804,8 +880,25 @@ impl Pss2MidiApp {
         content = content
             .child(calibration_progress_panel(&view, cx))
             .child(calibration_keyboard_panel(&view));
-        page = page.child(content);
-        page
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(
+                div()
+                    .size_full()
+                    .pr(px(16.0))
+                    .id("calibration-dashboard-scroll")
+                    .overflow_y_scroll()
+                    .track_scroll(&self.calibration_scroll_handle)
+                    .child(content),
+            )
+            .child(self.page_scrollbar(
+                "calibration-dashboard-scrollbar",
+                &self.calibration_scroll_handle,
+                cx,
+            ))
     }
 
     fn settings_dashboard(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1041,12 +1134,24 @@ impl Pss2MidiApp {
         content = content.child(advanced_panel);
 
         div()
+            .relative()
             .flex_1()
             .min_h_0()
             .w_full()
-            .id("settings-dashboard-scroll")
-            .overflow_y_scroll()
-            .child(content)
+            .child(
+                div()
+                    .size_full()
+                    .pr(px(16.0))
+                    .id("settings-dashboard-scroll")
+                    .overflow_y_scroll()
+                    .track_scroll(&self.settings_scroll_handle)
+                    .child(content),
+            )
+            .child(self.page_scrollbar(
+                "settings-dashboard-scrollbar",
+                &self.settings_scroll_handle,
+                cx,
+            ))
     }
 
     fn settings_text_field(
