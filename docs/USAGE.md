@@ -22,6 +22,23 @@ cargo run --release
 This is a desktop GUI application; there are no audio-conversion command-line
 options.
 
+## Run a binary release
+
+For the prebuilt Linux x86-64 release, download and extract
+`pss2midi-0.1.0-linux-x86_64.tar.gz`, then run:
+
+```bash
+cd pss2midi-0.1.0-linux-x86_64
+./pss2midi
+```
+
+The executable is dynamically linked, so the system needs the runtime libraries
+for ALSA, aubio, and its X11 or Wayland desktop backend. Package names vary by
+Linux distribution. If launch reports a missing shared library, install the
+distribution package that provides that library. The downloadable build is
+compiled on Gentoo Linux x86-64; it is not a static binary for every Linux
+distribution.
+
 ## Basic use
 
 1. **Choose the audio input.** In Live or Settings, open the device selector.
