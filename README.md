@@ -21,27 +21,16 @@ cargo build --release
 cargo run --release
 ```
 
-The application opens directly into the Live page and uses safe settings when
-no configuration exists. Select `PSS-F30 Audio MIDI` as the MIDI input in
-Neothesia or another MIDI application.
+The app opens on Live with the engine stopped by default. Connect the keyboard
+audio to a system input, choose that input, and press **Start**. Select
+`PSS-F30 Audio MIDI` as the MIDI input in Neothesia or another MIDI application.
+The YIN detector works without setup; Spectral requires calibration.
 
-## Calibration
-
-Open the Calibration page to record five accepted spectral examples for each
-key from MIDI 36 (C2) through MIDI 72 (C5). Follow the requested note and
-sample progress, and retry captures reported as quiet, clipped, or invalid.
-Completed templates are saved to
-`~/.config/pss2midi/pss-f30-templates.json`. The completion view's **Start
-Playing** action loads the saved templates, selects Spectral mode, and starts
-the engine if it is stopped.
-
-## Configuration
-
-Settings are stored separately from spectral samples in
-`~/.config/pss2midi/config.json`. The Settings page includes audio input,
-sample rate, detector mode, spectral thresholds and timing, plus advanced DSP
-controls. A missing or invalid template does not prevent YIN operation or
-application startup.
+See the [user guide](docs/USAGE.md) for the full walkthrough, calibration
+instructions, and an explanation of every setting and control. Settings are
+stored separately from spectral samples in
+`~/.config/pss2midi/config.json` and
+`~/.config/pss2midi/pss-f30-templates.json`, respectively.
 
 ## License
 
