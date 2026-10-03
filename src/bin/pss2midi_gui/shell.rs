@@ -5,8 +5,8 @@ use std::{
 
 use gpui::{
     div, point, prelude::*, px, relative, rgb, size, App, Context, CursorStyle, FocusHandle,
-    FontWeight, KeyDownEvent, MouseButton, Render, ScrollHandle, Subscription, Task, Window,
-    WindowBounds, WindowOptions,
+    FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, Render, ScrollHandle, Subscription,
+    Task, Window, WindowBounds, WindowOptions,
 };
 use pss2midi::{
     engine::{
@@ -708,7 +708,7 @@ impl Pss2MidiApp {
             .cursor_pointer()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |_, event, _, cx| {
+                cx.listener(move |_, event: &MouseDownEvent, _, cx| {
                     let bounds = click_handle.bounds();
                     let max_scroll = click_handle.max_offset().y;
                     if max_scroll > px(0.0) && bounds.size.height > px(0.0) {
