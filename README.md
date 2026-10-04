@@ -7,6 +7,8 @@ virtual output port. The Live page supports YIN, Spectral, and Compare detector
 modes; Calibration guides the user through creating spectral templates, and
 Settings stores audio and detector preferences.
 
+![pss2midi calibration page](docs/screenshot.jpg)
+
 ## Requirements
 
 - Linux with ALSA and PipeWire
